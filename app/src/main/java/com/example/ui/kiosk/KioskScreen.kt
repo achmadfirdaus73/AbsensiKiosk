@@ -108,7 +108,11 @@ fun KioskScreen(
     var isProcessingAttendance by remember { mutableStateOf(false) }
     var livenessHint by remember { mutableStateOf<String?>(null) }
     var trackedFaceRect by remember { mutableStateOf<RectF?>(null) }
+    var isSpoofDetected by remember { mutableStateOf(false) }
+    val antiSpoofTracker = remember { FaceBiometricHelper.AntiSpoofTracker() }
     val consensusBuffer = remember { mutableListOf<Long>() }
+
+    var isModelDownloading by remember { mutableStateOf(false) }
 
     // Auto-calculate biometric embeddings for existing registered employees if not yet cached
     LaunchedEffect(employees) {
@@ -127,6 +131,8 @@ fun KioskScreen(
                 isUnrecognizedFace = false
                 livenessHint = null
                 trackedFaceRect = null
+                isSpoofDetected = false
+                antiSpoofTracker.reset()
             }
         }
     }
@@ -206,41 +212,64 @@ fun KioskScreen(
                 onFaceBoundsTracked = { rect ->
                     trackedFaceRect = rect
                 },
-                onFaceBiometrics = { face: Face, liveVector: FloatArray ->
+                onFaceBiometricsInfo = { faceInfo, liveVector ->
                     isLiveFaceDetected = true
                     lastFaceDetectionTime = System.currentTimeMillis()
 
-                    val liveness = FaceBiometricHelper.evaluateLiveness(face)
-                    livenessHint = liveness.feedback
+                    val (livenessStatus, hint) = antiSpoofTracker.evaluate(faceInfo)
+                    livenessHint = hint
 
-                    if (employees.isNotEmpty() && liveness.isLive) {
-                        val match = repository.findBestMatchingEmployee(
-                            liveBiometricVector = liveVector,
-                            employees = employees,
-                            threshold = settings.faceConfidenceThreshold,
-                            templates = biometricTemplates
-                        )
-
-                        if (match != null) {
-                            consensusBuffer.add(match.first.id)
-                            if (consensusBuffer.size > 4) consensusBuffer.removeAt(0)
-
-                            // Smooth multi-frame consensus: candidate must win majority of recent frames or be >= 93% confident
-                            if (consensusBuffer.count { it == match.first.id } >= 2 || match.second >= 0.93f) {
-                                selectedEmployee = match.first
-                                matchConfidenceScore = match.second
-                                isUnrecognizedFace = false
-                            }
-                        } else {
-                            consensusBuffer.clear()
+                    when (livenessStatus) {
+                        FaceBiometricHelper.LivenessStatus.SUSPECTED_SPOOF_PHOTO -> {
+                            // Spoof / printed paper photo detected! Immediately block matching
+                            isSpoofDetected = true
                             selectedEmployee = null
                             isUnrecognizedFace = true
+                            consensusBuffer.clear()
                         }
-                    } else {
-                        consensusBuffer.clear()
-                        selectedEmployee = null
-                        isUnrecognizedFace = false
+                        FaceBiometricHelper.LivenessStatus.WAITING_FOR_BLINK -> {
+                            // Require natural human blink first before identifying employee
+                            isSpoofDetected = false
+                            selectedEmployee = null
+                            isUnrecognizedFace = false
+                            consensusBuffer.clear()
+                        }
+                        FaceBiometricHelper.LivenessStatus.VERIFIED_REAL_PERSON -> {
+                            // Real living human verified! Now safely match against employees
+                            isSpoofDetected = false
+                            if (employees.isNotEmpty()) {
+                                val match = repository.findBestMatchingEmployee(
+                                    liveBiometricVector = liveVector,
+                                    employees = employees,
+                                    threshold = settings.faceConfidenceThreshold,
+                                    templates = biometricTemplates
+                                )
+
+                                if (match != null) {
+                                    consensusBuffer.add(match.first.id)
+                                    if (consensusBuffer.size > 4) consensusBuffer.removeAt(0)
+
+                                    // Smooth multi-frame consensus: candidate must win majority of recent frames or be >= 93% confident
+                                    if (consensusBuffer.count { it == match.first.id } >= 2 || match.second >= 0.93f) {
+                                        selectedEmployee = match.first
+                                        matchConfidenceScore = match.second
+                                        isUnrecognizedFace = false
+                                    }
+                                } else {
+                                    consensusBuffer.clear()
+                                    selectedEmployee = null
+                                    isUnrecognizedFace = true
+                                }
+                            } else {
+                                consensusBuffer.clear()
+                                selectedEmployee = null
+                                isUnrecognizedFace = false
+                            }
+                        }
                     }
+                },
+                onModelDownloadStatusChanged = { downloading ->
+                    isModelDownloading = downloading
                 }
             )
         } else {
@@ -460,6 +489,34 @@ fun KioskScreen(
                         contentPadding = PaddingValues(horizontal = 12.dp)
                     ) {
                         Text("Admin", color = PureWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+
+            // High-Res AI Module Download Indicator
+            if (isModelDownloading) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = PrimaryNavy.copy(alpha = 0.92f),
+                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(12.dp),
+                            color = PrimaryBlue,
+                            strokeWidth = 2.dp
+                        )
+                        Text(
+                            text = "Menyiapkan modul AI offline presisi tinggi... (Mode Instan Aktif)",
+                            color = PureWhite,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium
+                        )
                     }
                 }
             }

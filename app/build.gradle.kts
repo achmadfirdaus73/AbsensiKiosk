@@ -70,8 +70,9 @@ dependencies {
     // ML Kit Face Detection (Bundled Model)
     implementation(libs.mlkit.face.detection)
 
-    // Location
+    // Location & Module Install
     implementation(libs.play.services.location)
+    implementation("com.google.android.gms:play-services-base:18.5.0")
 
     // Network & JSON
     implementation(libs.okhttp)

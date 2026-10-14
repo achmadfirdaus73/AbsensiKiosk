@@ -34,6 +34,38 @@ object FaceBiometricHelper {
     const val EMBEDDING_DIM = 128
     const val CANONICAL_IMAGE_SIZE = 112 // Standard 112x112 MobileFaceNet input size
 
+    data class FaceInfo(
+        val boundingBox: Rect,
+        val mlKitFace: Face? = null,
+        val leftEye: PointF? = null,
+        val rightEye: PointF? = null,
+        val leftEyeOpenProb: Float? = mlKitFace?.leftEyeOpenProbability,
+        val rightEyeOpenProb: Float? = mlKitFace?.rightEyeOpenProbability,
+        val smileProb: Float? = mlKitFace?.smilingProbability,
+        val headYaw: Float = mlKitFace?.headEulerAngleY ?: 0f,
+        val headRoll: Float = mlKitFace?.headEulerAngleZ ?: 0f,
+        val trackingId: Int? = mlKitFace?.trackingId,
+        val isFallback: Boolean = mlKitFace == null
+    ) {
+        companion object {
+            fun fromMlKit(face: Face): FaceInfo {
+                return FaceInfo(
+                    boundingBox = face.boundingBox,
+                    mlKitFace = face,
+                    leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position,
+                    rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position,
+                    leftEyeOpenProb = face.leftEyeOpenProbability,
+                    rightEyeOpenProb = face.rightEyeOpenProbability,
+                    smileProb = face.smilingProbability,
+                    headYaw = face.headEulerAngleY,
+                    headRoll = face.headEulerAngleZ,
+                    trackingId = face.trackingId,
+                    isFallback = false
+                )
+            }
+        }
+    }
+
     val biometricDetectorOptions: FaceDetectorOptions by lazy {
         FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
@@ -44,43 +76,201 @@ object FaceBiometricHelper {
             .build()
     }
 
-    data class LivenessResult(
-        val isLive: Boolean,
-        val livenessScore: Float,
-        val avgEyeOpenRatio: Float,
-        val feedback: String
-    )
+    enum class LivenessStatus {
+        WAITING_FOR_BLINK,        // Silakan Kedipkan Mata
+        VERIFIED_REAL_PERSON,     // Manusia Asli Terverifikasi
+        SUSPECTED_SPOOF_PHOTO     // Terdeteksi Foto Kertas / Layar HP
+    }
 
     /**
-     * Evaluates passive liveness and anti-spoofing to prevent photo/screen bypasses.
+     * Active & Passive Anti-Spoofing Presentation Attack Detector.
+     * Prevents printed paper photos, cardboard cutouts, and smartphone screens from spoofing attendance.
+     * Requires genuine dynamic life signals (live blink sequence or natural neutral-to-smile transition),
+     * and strictly rejects static smiles printed on paper photos.
      */
-    fun evaluateLiveness(face: Face): LivenessResult {
-        val leftOpen = face.leftEyeOpenProbability ?: 0.9f
-        val rightOpen = face.rightEyeOpenProbability ?: 0.9f
-        val avgEyeOpen = (leftOpen + rightOpen) / 2f
-        val yaw = abs(face.headEulerAngleY)
-        val roll = abs(face.headEulerAngleZ)
+    class AntiSpoofTracker {
+        private var wasEyesOpen = false
+        private var wasEyesClosed = false
+        private var wasNeutralFace = false
+        private var firstSeenTime = 0L
+        private var lastEyeOpenProb = -1f
+        private var staticFrameCount = 0
+        private var lastTrackingId: Int? = null
+        private var verifiedExpiryTime = 0L
+        private val recentCenters = mutableListOf<Float>()
 
-        val isTooTilted = yaw > 25f || roll > 22f
+        var isLiveVerified = false
+            private set
 
-        val score = when {
-            isTooTilted -> 0.40f
-            avgEyeOpen < 0.12f -> 0.85f // Active blink moment detected
-            else -> 0.95f
+        fun reset() {
+            wasEyesOpen = false
+            wasEyesClosed = false
+            wasNeutralFace = false
+            firstSeenTime = 0L
+            lastEyeOpenProb = -1f
+            staticFrameCount = 0
+            isLiveVerified = false
+            verifiedExpiryTime = 0L
+            recentCenters.clear()
         }
 
-        val feedback = when {
-            yaw > 20f -> "Tatap lurus ke depan"
-            roll > 18f -> "Posisikan kepala tegak"
-            else -> "Posisi Wajah Sempurna"
+        fun evaluate(face: Face): Pair<LivenessStatus, String> {
+            return evaluate(FaceInfo.fromMlKit(face))
         }
 
-        return LivenessResult(
-            isLive = score >= 0.70f,
-            livenessScore = score,
-            avgEyeOpenRatio = avgEyeOpen,
-            feedback = feedback
-        )
+        fun evaluate(faceInfo: FaceInfo): Pair<LivenessStatus, String> {
+            val now = System.currentTimeMillis()
+
+            // If tracking ID changed (new face entered frame), reset immediately
+            if (faceInfo.trackingId != null) {
+                if (lastTrackingId != null && lastTrackingId != faceInfo.trackingId) {
+                    reset()
+                }
+                lastTrackingId = faceInfo.trackingId
+            }
+
+            if (firstSeenTime == 0L) {
+                firstSeenTime = now
+            }
+
+            // Extreme tilt warning
+            if (abs(faceInfo.headYaw) > 26f) return Pair(LivenessStatus.WAITING_FOR_BLINK, "Tatap lurus ke depan")
+            if (abs(faceInfo.headRoll) > 22f) return Pair(LivenessStatus.WAITING_FOR_BLINK, "Tegakkan posisi kepala")
+
+            val left = faceInfo.leftEyeOpenProb ?: -1f
+            val right = faceInfo.rightEyeOpenProb ?: -1f
+            val smile = faceInfo.smileProb ?: -1f
+
+            // 1. Check if previously verified and still within the 3.5s valid window
+            if (isLiveVerified) {
+                if (now <= verifiedExpiryTime) {
+                    return Pair(LivenessStatus.VERIFIED_REAL_PERSON, "✓ Orang Asli Terverifikasi")
+                } else {
+                    isLiveVerified = false
+                }
+            }
+
+            // 2. Active Expression Verification: REQUIRES dynamic transition from neutral to smile
+            // (A static photo with a printed smile never transitions from neutral, so this prevents paper spoofing)
+            if (smile >= 0f) {
+                if (smile < 0.35f) {
+                    wasNeutralFace = true
+                } else if (smile > 0.65f && wasNeutralFace) {
+                    isLiveVerified = true
+                    verifiedExpiryTime = now + 3500L
+                    return Pair(LivenessStatus.VERIFIED_REAL_PERSON, "✓ Senyuman Nyata Terverifikasi")
+                }
+            }
+
+            // 3. Dynamic Human Blink Cycle (Open > 0.60 -> Closed < 0.28 -> Open > 0.60)
+            if (left >= 0f && right >= 0f) {
+                val avg = (left + right) / 2f
+
+                // Track static frames (printed paper photos have near-zero natural eye variance)
+                if (lastEyeOpenProb >= 0f && abs(avg - lastEyeOpenProb) < 0.020f) {
+                    staticFrameCount++
+                } else {
+                    staticFrameCount = max(0, staticFrameCount - 1)
+                }
+                lastEyeOpenProb = avg
+
+                if (avg > 0.60f) {
+                    if (wasEyesClosed && wasEyesOpen) {
+                        // Human completed full natural blink cycle!
+                        isLiveVerified = true
+                        verifiedExpiryTime = now + 3500L
+                        return Pair(LivenessStatus.VERIFIED_REAL_PERSON, "✓ Kedipan Asli Terverifikasi")
+                    }
+                    wasEyesOpen = true
+                } else if (avg < 0.28f && wasEyesOpen) {
+                    wasEyesClosed = true
+                }
+
+                // If face has been shown for > 600ms with completely static features -> FLAG AS SPOOF / FAKE!
+                if (now - firstSeenTime > 600 && staticFrameCount >= 4 && !isLiveVerified) {
+                    return Pair(LivenessStatus.SUSPECTED_SPOOF_PHOTO, "⛔ Terdeteksi Foto Kertas / Layar HP (Palsu)")
+                }
+            } else {
+                // Fallback liveness check (e.g. native detector fallback without eye landmarks):
+                // Analyze natural micro-motion of head posture
+                val centerX = (faceInfo.boundingBox.left + faceInfo.boundingBox.right) / 2f
+                recentCenters.add(centerX)
+                if (recentCenters.size > 15) recentCenters.removeAt(0)
+
+                if (recentCenters.size >= 8) {
+                    val mean = recentCenters.average().toFloat()
+                    val variance = recentCenters.map { (it - mean) * (it - mean) }.average()
+                    val stdDev = sqrt(variance).toFloat()
+
+                    if (now - firstSeenTime > 1500) {
+                        if (stdDev < 0.4f) {
+                            // Completely rigid, zero micro-motion -> static paper photo!
+                            return Pair(LivenessStatus.SUSPECTED_SPOOF_PHOTO, "⛔ Terdeteksi Foto Kertas / Layar HP (Palsu)")
+                        } else if (stdDev in 0.8f..9.0f) {
+                            // Natural living human postural sway
+                            isLiveVerified = true
+                            verifiedExpiryTime = now + 3500L
+                            return Pair(LivenessStatus.VERIFIED_REAL_PERSON, "✓ Orang Asli Terverifikasi")
+                        }
+                    }
+                }
+            }
+
+            return Pair(LivenessStatus.WAITING_FOR_BLINK, "👁️ Silakan Kedipkan Mata")
+        }
+    }
+
+    /**
+     * High-Speed Native Android Face Detector Fallback (100% Offline, Zero-Download).
+     * Uses android.media.FaceDetector built into the Android OS to ensure face detection
+     * works immediately even if ML Kit face module is still being downloaded by Google Play Services.
+     */
+    fun detectFaceNative(bitmap: Bitmap): FaceInfo? {
+        if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return null
+        return try {
+            val w = bitmap.width
+            val h = bitmap.height
+            val evenW = if (w % 2 == 0) w else w - 1
+            val evenH = h
+            val bmp565 = if (bitmap.config == Bitmap.Config.RGB_565 && w == evenW) {
+                bitmap
+            } else {
+                Bitmap.createBitmap(bitmap, 0, 0, evenW, evenH).copy(Bitmap.Config.RGB_565, false)
+            }
+
+            val detector = android.media.FaceDetector(evenW, evenH, 1)
+            val faces = arrayOfNulls<android.media.FaceDetector.Face>(1)
+            val count = detector.findFaces(bmp565, faces)
+
+            val result = if (count > 0 && faces[0] != null) {
+                val f = faces[0]!!
+                val pt = PointF()
+                f.getMidPoint(pt)
+                val eyesDist = f.eyesDistance()
+                val left = (pt.x - eyesDist * 1.35f).toInt().coerceIn(0, w)
+                val right = (pt.x + eyesDist * 1.35f).toInt().coerceIn(0, w)
+                val top = (pt.y - eyesDist * 1.45f).toInt().coerceIn(0, h)
+                val bottom = (pt.y + eyesDist * 1.75f).toInt().coerceIn(0, h)
+
+                val leftEye = PointF(pt.x - eyesDist / 2f, pt.y)
+                val rightEye = PointF(pt.x + eyesDist / 2f, pt.y)
+
+                FaceInfo(
+                    boundingBox = Rect(left, top, right, bottom),
+                    mlKitFace = null,
+                    leftEye = leftEye,
+                    rightEye = rightEye
+                )
+            } else null
+
+            if (bmp565 != bitmap) {
+                bmp565.recycle()
+            }
+            result
+        } catch (e: Exception) {
+            Log.w(TAG, "Native face detector fallback notice: ${e.message}")
+            null
+        }
     }
 
     /**
@@ -89,10 +279,14 @@ object FaceBiometricHelper {
      * and equalizes lighting for illumination invariance.
      */
     fun alignAndCropFace(sourceBitmap: Bitmap, face: Face): Bitmap? {
+        return alignAndCropFace(sourceBitmap, FaceInfo.fromMlKit(face))
+    }
+
+    fun alignAndCropFace(sourceBitmap: Bitmap, faceInfo: FaceInfo): Bitmap? {
         if (sourceBitmap.isRecycled) return null
 
-        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
-        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+        val leftEye = faceInfo.leftEye ?: faceInfo.mlKitFace?.getLandmark(FaceLandmark.LEFT_EYE)?.position
+        val rightEye = faceInfo.rightEye ?: faceInfo.mlKitFace?.getLandmark(FaceLandmark.RIGHT_EYE)?.position
 
         return try {
             val rawCrop = if (leftEye != null && rightEye != null) {
@@ -127,7 +321,7 @@ object FaceBiometricHelper {
                 alignedBitmap
             } else {
                 // Fallback: Safe Bounding Box Crop with proportional margin
-                val box = face.boundingBox
+                val box = faceInfo.boundingBox
                 val marginX = (box.width() * 0.15f).toInt()
                 val marginY = (box.height() * 0.15f).toInt()
                 val left = max(0, box.left - marginX)
@@ -150,7 +344,7 @@ object FaceBiometricHelper {
             if (balancedBitmap != rawCrop) rawCrop.recycle()
             balancedBitmap
         } catch (e: Exception) {
-            Log.e(TAG, "Error aligning and cropping face", e)
+            Log.w(TAG, "Error aligning and cropping face: ${e.message}")
             null
         }
     }
@@ -239,24 +433,28 @@ object FaceBiometricHelper {
      * Features 28..127: Multi-Zone Regional Spatial Descriptors (Periocular, Mid-Face, and Jawline gradients).
      */
     fun extractFeatureVector(face: Face, alignedBitmap: Bitmap? = null): FloatArray {
+        return extractFeatureVector(FaceInfo.fromMlKit(face), alignedBitmap)
+    }
+
+    fun extractFeatureVector(faceInfo: FaceInfo, alignedBitmap: Bitmap? = null): FloatArray {
         val embedding = FloatArray(EMBEDDING_DIM)
-        val box = face.boundingBox
+        val box = faceInfo.boundingBox
         val boxWidth = max(1f, box.width().toFloat())
         val boxHeight = max(1f, box.height().toFloat())
         val boxLeft = box.left.toFloat()
         val boxTop = box.top.toFloat()
 
         // 1. Core Facial Landmarks
-        val leftEye = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
-        val rightEye = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
-        val noseBase = face.getLandmark(FaceLandmark.NOSE_BASE)?.position
-        val mouthLeft = face.getLandmark(FaceLandmark.MOUTH_LEFT)?.position
-        val mouthRight = face.getLandmark(FaceLandmark.MOUTH_RIGHT)?.position
-        val mouthBottom = face.getLandmark(FaceLandmark.MOUTH_BOTTOM)?.position
-        val leftCheek = face.getLandmark(FaceLandmark.LEFT_CHEEK)?.position
-        val rightCheek = face.getLandmark(FaceLandmark.RIGHT_CHEEK)?.position
-        val leftEar = face.getLandmark(FaceLandmark.LEFT_EAR)?.position
-        val rightEar = face.getLandmark(FaceLandmark.RIGHT_EAR)?.position
+        val leftEye = faceInfo.leftEye ?: faceInfo.mlKitFace?.getLandmark(FaceLandmark.LEFT_EYE)?.position
+        val rightEye = faceInfo.rightEye ?: faceInfo.mlKitFace?.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+        val noseBase = faceInfo.mlKitFace?.getLandmark(FaceLandmark.NOSE_BASE)?.position
+        val mouthLeft = faceInfo.mlKitFace?.getLandmark(FaceLandmark.MOUTH_LEFT)?.position
+        val mouthRight = faceInfo.mlKitFace?.getLandmark(FaceLandmark.MOUTH_RIGHT)?.position
+        val mouthBottom = faceInfo.mlKitFace?.getLandmark(FaceLandmark.MOUTH_BOTTOM)?.position
+        val leftCheek = faceInfo.mlKitFace?.getLandmark(FaceLandmark.LEFT_CHEEK)?.position
+        val rightCheek = faceInfo.mlKitFace?.getLandmark(FaceLandmark.RIGHT_CHEEK)?.position
+        val leftEar = faceInfo.mlKitFace?.getLandmark(FaceLandmark.LEFT_EAR)?.position
+        val rightEar = faceInfo.mlKitFace?.getLandmark(FaceLandmark.RIGHT_EAR)?.position
 
         val eyeDist = if (leftEye != null && rightEye != null) {
             max(10f, hypot(leftEye.x - rightEye.x, leftEye.y - rightEye.y))
@@ -510,9 +708,15 @@ object FaceBiometricHelper {
                 val bitmap = loadAndCorrectBitmap(context, photoUriStr) ?: return@withContext null
                 val image = InputImage.fromBitmap(bitmap, 0)
                 val detector = FaceDetection.getClient(biometricDetectorOptions)
-                val task = detector.process(image)
-                val faces: List<Face> = Tasks.await(task)
-                detector.close()
+                val faces: List<Face> = try {
+                    val task = detector.process(image)
+                    Tasks.await(task)
+                } catch (e: Exception) {
+                    Log.w(TAG, "ML Kit processing notice (using fallback): ${e.message}")
+                    emptyList()
+                } finally {
+                    try { detector.close() } catch (_: Exception) {}
+                }
 
                 val vector = if (faces.isNotEmpty()) {
                     val primaryFace = faces.maxByOrNull { f -> f.boundingBox.width() * f.boundingBox.height() } ?: faces.first()
@@ -521,12 +725,19 @@ object FaceBiometricHelper {
                     alignedCrop?.recycle()
                     feat
                 } else {
-                    null
+                    // Fallback to native Android FaceDetector
+                    val nativeFace = detectFaceNative(bitmap)
+                    if (nativeFace != null) {
+                        val alignedCrop = alignAndCropFace(bitmap, nativeFace)
+                        val feat = extractFeatureVector(nativeFace, alignedCrop)
+                        alignedCrop?.recycle()
+                        feat
+                    } else null
                 }
                 bitmap.recycle()
                 vector
             } catch (e: Exception) {
-                Log.e(TAG, "Error extracting embedding from uri: $photoUriStr", e)
+                Log.w(TAG, "Notice extracting embedding from uri: $photoUriStr: ${e.message}")
                 null
             }
         }
@@ -540,9 +751,15 @@ object FaceBiometricHelper {
             try {
                 val image = InputImage.fromBitmap(bitmap, 0)
                 val detector = FaceDetection.getClient(biometricDetectorOptions)
-                val task = detector.process(image)
-                val faces: List<Face> = Tasks.await(task)
-                detector.close()
+                val faces: List<Face> = try {
+                    val task = detector.process(image)
+                    Tasks.await(task)
+                } catch (e: Exception) {
+                    Log.w(TAG, "ML Kit bitmap processing notice (using fallback): ${e.message}")
+                    emptyList()
+                } finally {
+                    try { detector.close() } catch (_: Exception) {}
+                }
 
                 if (faces.isNotEmpty()) {
                     val primaryFace = faces.maxByOrNull { f -> f.boundingBox.width() * f.boundingBox.height() } ?: faces.first()
@@ -551,10 +768,17 @@ object FaceBiometricHelper {
                     alignedCrop?.recycle()
                     feat
                 } else {
-                    null
+                    // Fallback to native Android FaceDetector
+                    val nativeFace = detectFaceNative(bitmap)
+                    if (nativeFace != null) {
+                        val alignedCrop = alignAndCropFace(bitmap, nativeFace)
+                        val feat = extractFeatureVector(nativeFace, alignedCrop)
+                        alignedCrop?.recycle()
+                        feat
+                    } else null
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error extracting embedding from bitmap", e)
+                Log.w(TAG, "Notice extracting embedding from bitmap: ${e.message}")
                 null
             }
         }
@@ -585,7 +809,7 @@ object FaceBiometricHelper {
             0f
         }
 
-        return cosineSim.coerceIn(0f, 0.99f)
+        return cosineSim.coerceIn(0f, 1.0f)
     }
 
     fun serializeEmbedding(features: FloatArray): String {
