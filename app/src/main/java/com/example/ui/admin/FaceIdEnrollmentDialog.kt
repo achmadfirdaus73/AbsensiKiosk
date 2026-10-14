@@ -179,7 +179,7 @@ fun FaceIdEnrollmentDialog(
                                                     alignedCrop?.recycle()
                                                     frameBmp?.recycle()
 
-                                                                                                                                                              val newProg = (collectedVectors.size / 60f).coerceIn(0f, 1f)
+                                                                                                                                                                                                                   val newProg = (collectedVectors.size / 60f).coerceIn(0f, 1f)
                                                     enrollmentProgress = newProg
 
                                                     currentInstruction = when {
