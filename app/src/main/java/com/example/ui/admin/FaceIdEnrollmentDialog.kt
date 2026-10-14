@@ -76,6 +76,7 @@ fun FaceIdEnrollmentDialog(
     var masterEmbeddingJson by remember { mutableStateOf<String?>(null) }
 
     val collectedVectors = remember { mutableListOf<FloatArray>() }
+    var lastCollectionTime by remember { mutableLongStateOf(0L) }
     var bestSnapshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     val faceDetector: FaceDetector = remember {
@@ -178,7 +179,7 @@ fun FaceIdEnrollmentDialog(
                                                     alignedCrop?.recycle()
                                                     frameBmp?.recycle()
 
-                                                    val newProg = (collectedVectors.size / 12f).coerceIn(0f, 1f)
+                                                                                                                                                              val newProg = (collectedVectors.size / 60f).coerceIn(0f, 1f)
                                                     enrollmentProgress = newProg
 
                                                     currentInstruction = when {
