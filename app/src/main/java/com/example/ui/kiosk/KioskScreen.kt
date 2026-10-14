@@ -215,57 +215,35 @@ fun KioskScreen(
                 onFaceBiometricsInfo = { faceInfo, liveVector ->
                     isLiveFaceDetected = true
                     lastFaceDetectionTime = System.currentTimeMillis()
+                    isSpoofDetected = false
 
-                    val (livenessStatus, hint) = antiSpoofTracker.evaluate(faceInfo)
-                    livenessHint = hint
+                    if (employees.isNotEmpty()) {
+                        val match = repository.findBestMatchingEmployee(
+                            liveBiometricVector = liveVector,
+                            employees = employees,
+                            threshold = settings.faceConfidenceThreshold,
+                            templates = biometricTemplates
+                        )
 
-                    when (livenessStatus) {
-                        FaceBiometricHelper.LivenessStatus.SUSPECTED_SPOOF_PHOTO -> {
-                            // Spoof / printed paper photo detected! Immediately block matching
-                            isSpoofDetected = true
-                            selectedEmployee = null
-                            isUnrecognizedFace = true
-                            consensusBuffer.clear()
-                        }
-                        FaceBiometricHelper.LivenessStatus.WAITING_FOR_BLINK -> {
-                            // Require natural human blink first before identifying employee
-                            isSpoofDetected = false
-                            selectedEmployee = null
-                            isUnrecognizedFace = false
-                            consensusBuffer.clear()
-                        }
-                        FaceBiometricHelper.LivenessStatus.VERIFIED_REAL_PERSON -> {
-                            // Real living human verified! Now safely match against employees
-                            isSpoofDetected = false
-                            if (employees.isNotEmpty()) {
-                                val match = repository.findBestMatchingEmployee(
-                                    liveBiometricVector = liveVector,
-                                    employees = employees,
-                                    threshold = settings.faceConfidenceThreshold,
-                                    templates = biometricTemplates
-                                )
+                        if (match != null) {
+                            consensusBuffer.add(match.first.id)
+                            if (consensusBuffer.size > 4) consensusBuffer.removeAt(0)
 
-                                if (match != null) {
-                                    consensusBuffer.add(match.first.id)
-                                    if (consensusBuffer.size > 4) consensusBuffer.removeAt(0)
-
-                                    // Smooth multi-frame consensus: candidate must win majority of recent frames or be >= 93% confident
-                                    if (consensusBuffer.count { it == match.first.id } >= 2 || match.second >= 0.93f) {
-                                        selectedEmployee = match.first
-                                        matchConfidenceScore = match.second
-                                        isUnrecognizedFace = false
-                                    }
-                                } else {
-                                    consensusBuffer.clear()
-                                    selectedEmployee = null
-                                    isUnrecognizedFace = true
-                                }
-                            } else {
-                                consensusBuffer.clear()
-                                selectedEmployee = null
+                            // Smooth multi-frame consensus: candidate must win majority of recent frames or be >= 93% confident
+                            if (consensusBuffer.count { it == match.first.id } >= 2 || match.second >= 0.93f) {
+                                selectedEmployee = match.first
+                                matchConfidenceScore = match.second
                                 isUnrecognizedFace = false
                             }
+                        } else {
+                            consensusBuffer.clear()
+                            selectedEmployee = null
+                            isUnrecognizedFace = true
                         }
+                    } else {
+                        consensusBuffer.clear()
+                        selectedEmployee = null
+                        isUnrecognizedFace = false
                     }
                 },
                 onModelDownloadStatusChanged = { downloading ->
@@ -295,22 +273,7 @@ fun KioskScreen(
             }
         }
 
-        // Clean subtle light gradient for top and bottom readability
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            PureWhite.copy(alpha = 0.85f),
-                            Color.Transparent,
-                            PureWhite.copy(alpha = 0.80f)
-                        ),
-                        startY = 0f,
-                        endY = Float.POSITIVE_INFINITY
-                    )
-                )
-        )
+
 
         // 2. 🔲 DYNAMIC AI FACE TRACKING RETICLE (Follows Face in Real-Time)
         Box(
@@ -383,8 +346,7 @@ fun KioskScreen(
                         val statusLabel = when {
                             selectedEmployee != null -> "Wajah Cocok: ${selectedEmployee!!.name} (${(matchConfidenceScore * 100).toInt()}%)"
                             isUnrecognizedFace && isLiveFaceDetected -> "Wajah Belum Terdaftar"
-                            !livenessHint.isNullOrBlank() && livenessHint != "Posisi Wajah Sempurna" -> livenessHint!!
-                            isLiveFaceDetected -> "Menyelaraskan Wajah..."
+                            isLiveFaceDetected -> "Mengenali Wajah..."
                             else -> "Posisikan Wajah ke Kamera"
                         }
 

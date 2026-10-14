@@ -182,9 +182,10 @@ fun FaceIdEnrollmentDialog(
                                                     enrollmentProgress = newProg
 
                                                     currentInstruction = when {
-                                                        newProg < 0.35f -> "Tahan dan tatap kamera lurus..."
-                                                        newProg < 0.70f -> "Bagus! Tetap stabil..."
-                                                        newProg < 0.95f -> "Hampir selesai, memproses biometrik..."
+                                                        newProg < 0.25f -> "Silakan kedipkan mata..."
+                                                        newProg < 0.50f -> "Menoleh sedikit ke kiri..."
+                                                        newProg < 0.75f -> "Menoleh sedikit ke kanan..."
+                                                        newProg < 0.95f -> "Tatap lurus kembali..."
                                                         else -> "Selesai!"
                                                     }
 
@@ -264,9 +265,10 @@ fun FaceIdEnrollmentDialog(
                                                         val newProg = (collectedVectors.size / 36f).coerceIn(0f, 1f)
                                                         enrollmentProgress = newProg
                                                         currentInstruction = when {
-                                                            newProg < 0.35f -> "Tahan dan tatap kamera lurus..."
-                                                            newProg < 0.70f -> "Bagus! Tetap stabil..."
-                                                            newProg < 0.95f -> "Hampir selesai, memproses biometrik..."
+                                                            newProg < 0.25f -> "Silakan kedipkan mata..."
+                                                            newProg < 0.50f -> "Menoleh sedikit ke kiri..."
+                                                            newProg < 0.75f -> "Menoleh sedikit ke kanan..."
+                                                            newProg < 0.95f -> "Tatap lurus kembali..."
                                                             else -> "Selesai! Memproses multi-sudut wajah..."
                                                         }
 
