@@ -1,0 +1,16 @@
+/build
+/app/build
+.gradle
+.kotlin
+*.iml
+.idea/
+.DS_Store
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+.env
+debug.keystore
+*.apk
+*.aab
+.aistudio/
