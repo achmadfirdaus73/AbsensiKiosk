@@ -114,6 +114,11 @@ fun KioskScreen(
 
     var isModelDownloading by remember { mutableStateOf(false) }
 
+    var scanMatchCount by remember { mutableIntStateOf(0) }
+    var scanCandidateId by remember { mutableStateOf<Long?>(null) }
+    var scanCandidateName by remember { mutableStateOf("") }
+    var scanProgress by remember { mutableFloatStateOf(0f) }
+
     // Auto-calculate biometric embeddings for existing registered employees if not yet cached
     LaunchedEffect(employees) {
         if (employees.isNotEmpty()) {
@@ -132,6 +137,10 @@ fun KioskScreen(
                 livenessHint = null
                 trackedFaceRect = null
                 isSpoofDetected = false
+                scanMatchCount = 0
+                scanCandidateId = null
+                scanCandidateName = ""
+                scanProgress = 0f
                 antiSpoofTracker.reset()
             }
         }
@@ -217,7 +226,7 @@ fun KioskScreen(
                     lastFaceDetectionTime = System.currentTimeMillis()
                     isSpoofDetected = false
 
-                    if (employees.isNotEmpty()) {
+                    if (employees.isNotEmpty() && selectedEmployee == null) {
                         val match = repository.findBestMatchingEmployee(
                             liveBiometricVector = liveVector,
                             employees = employees,
@@ -226,23 +235,36 @@ fun KioskScreen(
                         )
 
                         if (match != null) {
-                            consensusBuffer.add(match.first.id)
-                            if (consensusBuffer.size > 4) consensusBuffer.removeAt(0)
+                            val emp = match.first
+                            val conf = match.second
 
-                            // Smooth multi-frame consensus: candidate must win majority of recent frames or be >= 93% confident
-                            if (consensusBuffer.count { it == match.first.id } >= 2 || match.second >= 0.93f) {
-                                selectedEmployee = match.first
-                                matchConfidenceScore = match.second
+                            if (scanCandidateId == emp.id) {
+                                scanMatchCount++
+                            } else {
+                                scanCandidateId = emp.id
+                                scanCandidateName = emp.name
+                                scanMatchCount = 1
+                            }
+
+                            scanProgress = (scanMatchCount / 10f).coerceIn(0f, 1f)
+
+                            // Require 10 consistent frames (~1.5 seconds) to thoroughly scan and recognize facial contours
+                            if (scanMatchCount >= 10 || conf >= 0.95f) {
+                                selectedEmployee = emp
+                                matchConfidenceScore = conf
                                 isUnrecognizedFace = false
+                                scanProgress = 1f
                             }
                         } else {
-                            consensusBuffer.clear()
-                            selectedEmployee = null
-                            isUnrecognizedFace = true
+                            scanMatchCount = maxOf(0, scanMatchCount - 1)
+                            if (scanMatchCount == 0) {
+                                scanCandidateId = null
+                                scanCandidateName = ""
+                                scanProgress = 0f
+                                isUnrecognizedFace = true
+                            }
                         }
-                    } else {
-                        consensusBuffer.clear()
-                        selectedEmployee = null
+                    } else if (employees.isEmpty()) {
                         isUnrecognizedFace = false
                     }
                 },
@@ -345,8 +367,9 @@ fun KioskScreen(
 
                         val statusLabel = when {
                             selectedEmployee != null -> "Wajah Cocok: ${selectedEmployee!!.name} (${(matchConfidenceScore * 100).toInt()}%)"
+                            scanProgress > 0f && scanCandidateName.isNotEmpty() -> "Memindai Kontur: $scanCandidateName (${(scanProgress * 100).toInt()}%)..."
                             isUnrecognizedFace && isLiveFaceDetected -> "Wajah Belum Terdaftar"
-                            isLiveFaceDetected -> "Mengenali Wajah..."
+                            isLiveFaceDetected -> "Mengenali Kontur Wajah..."
                             else -> "Posisikan Wajah ke Kamera"
                         }
 
