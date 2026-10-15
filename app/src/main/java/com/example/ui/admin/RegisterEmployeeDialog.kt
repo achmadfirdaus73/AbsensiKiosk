@@ -37,6 +37,7 @@ import com.example.data.model.Employee
 import com.example.data.model.KioskSettings
 import com.example.data.model.ShiftAssignmentType
 import com.example.ui.theme.*
+import com.example.util.FaceBiometricHelper
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.FileOutputStream
@@ -96,6 +97,30 @@ fun RegisterEmployeeDialog(
         }
     }
 
+    // Biometric Extraction State
+    var isExtractingBiometrics by remember { mutableStateOf(false) }
+    var biometricExtractionStatus by remember { mutableStateOf<String?>(null) }
+
+    fun processPhotoForBiometrics(path: String) {
+        coroutineScope.launch {
+            isExtractingBiometrics = true
+            biometricExtractionStatus = "Mengekstrak biometrik wajah..."
+            try {
+                val vector = FaceBiometricHelper.extractEmbeddingFromUri(context, path)
+                if (vector != null && vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
+                    enrolledFaceEmbedding = FaceBiometricHelper.serializeEmbedding(vector)
+                    biometricExtractionStatus = "✓ Biometrik berhasil diekstrak (MobileFaceNet)"
+                } else {
+                    biometricExtractionStatus = "Wajah tidak terdeteksi pada foto. Silakan gunakan 'Pindai Face ID'."
+                }
+            } catch (e: Exception) {
+                biometricExtractionStatus = "Gagal memproses foto: ${e.message}"
+            } finally {
+                isExtractingBiometrics = false
+            }
+        }
+    }
+
     // Camera Capture Launcher
     val takePhotoLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicturePreview()
@@ -105,6 +130,7 @@ fun RegisterEmployeeDialog(
             val savedPath = saveBitmapToInternal(bitmap)
             if (savedPath != null) {
                 photoUriString = savedPath
+                processPhotoForBiometrics(savedPath)
             }
         }
     }
@@ -118,8 +144,10 @@ fun RegisterEmployeeDialog(
             val savedPath = saveUriToInternal(uri)
             if (savedPath != null) {
                 photoUriString = savedPath
+                processPhotoForBiometrics(savedPath)
             } else {
                 photoUriString = uri.toString()
+                processPhotoForBiometrics(uri.toString())
             }
         }
     }
@@ -281,11 +309,32 @@ fun RegisterEmployeeDialog(
                                         }
                                     }
                                 }
-                                Text(
-                                    text = if (enrolledFaceEmbedding != null) "Vektor biometrik aktif & siap untuk Kiosk" else "Daftarkan wajah dengan pemindai Face ID",
-                                    color = TextSecondaryLight,
-                                    fontSize = 11.sp
-                                )
+                                if (isExtractingBiometrics) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 1.5.dp, color = PrimaryNavy)
+                                        Text(
+                                            text = "Mengekstrak biometrik wajah...",
+                                            color = PrimaryNavy,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                } else if (biometricExtractionStatus != null) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = biometricExtractionStatus ?: "",
+                                        color = if (enrolledFaceEmbedding != null) AccentGreen else AccentAmber,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                } else {
+                                    Text(
+                                        text = if (enrolledFaceEmbedding != null) "Vektor biometrik aktif & siap untuk Kiosk" else "Daftarkan wajah dengan pemindai Face ID",
+                                        color = TextSecondaryLight,
+                                        fontSize = 11.sp
+                                    )
+                                }
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Button(

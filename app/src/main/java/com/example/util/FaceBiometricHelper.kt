@@ -86,6 +86,16 @@ object FaceBiometricHelper {
             .build()
     }
 
+    val fastDetectorOptions: FaceDetectorOptions by lazy {
+        FaceDetectorOptions.Builder()
+            .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+            .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+            .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+            .setMinFaceSize(0.10f)
+            .enableTracking()
+            .build()
+    }
+
     enum class LivenessStatus {
         WAITING_FOR_ACTION,       // Silakan Kedipkan Mata atau Tersenyum
         VERIFIED_REAL_PERSON,     // Manusia Asli Terverifikasi

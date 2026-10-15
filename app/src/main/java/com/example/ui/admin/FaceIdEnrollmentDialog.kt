@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FlipCameraAndroid
@@ -25,12 +26,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -40,7 +41,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import com.example.ui.theme.*
 import com.example.util.AudioFeedbackHelper
 import com.example.util.FaceBiometricHelper
 import com.google.mlkit.vision.common.InputImage
@@ -55,6 +55,8 @@ import java.util.concurrent.Executors
 import kotlin.math.cos
 import kotlin.math.sin
 
+private const val TARGET_ENROLLMENT_FRAMES = 10
+
 @OptIn(ExperimentalGetImage::class)
 @Composable
 fun FaceIdEnrollmentDialog(
@@ -67,28 +69,110 @@ fun FaceIdEnrollmentDialog(
     val coroutineScope = rememberCoroutineScope()
     val audioHelper = remember { AudioFeedbackHelper(context) }
 
+    LaunchedEffect(Unit) {
+        FaceBiometricHelper.init(context)
+    }
+
     var useFrontCamera by remember { mutableStateOf(true) }
     var enrollmentProgress by remember { mutableFloatStateOf(0f) }
     var currentInstruction by remember { mutableStateOf("Posisikan wajah di dalam lingkaran") }
     var isFaceInsideCircle by remember { mutableStateOf(false) }
     var isComplete by remember { mutableStateOf(false) }
+    var isCapturingInstant by remember { mutableStateOf(false) }
     var capturedPhotoPath by remember { mutableStateOf<String?>(null) }
     var masterEmbeddingJson by remember { mutableStateOf<String?>(null) }
 
     val collectedVectors = remember { mutableListOf<FloatArray>() }
     var lastCollectionTime by remember { mutableLongStateOf(0L) }
     var bestSnapshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var latestDetectedFace by remember { mutableStateOf<Face?>(null) }
+    var latestFrameBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     val faceDetector: FaceDetector = remember {
-        FaceDetection.getClient(FaceBiometricHelper.biometricDetectorOptions)
+        FaceDetection.getClient(FaceBiometricHelper.fastDetectorOptions)
     }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    fun finishEnrollment(vectors: List<FloatArray>, photoBitmap: Bitmap?) {
+        if (isComplete || vectors.isEmpty()) return
+        isComplete = true
+        coroutineScope.launch {
+            audioHelper.playSuccessBeep()
+            val dim = FaceBiometricHelper.EMBEDDING_DIM
+            val masterVector = if (vectors.size == 1) {
+                vectors[0].copyOf()
+            } else {
+                val preliminaryMean = FloatArray(dim)
+                for (v in vectors) {
+                    for (i in 0 until dim) preliminaryMean[i] += v[i]
+                }
+                FaceBiometricHelper.l2Normalize(preliminaryMean)
+
+                val validVectors = vectors.filter { v ->
+                    FaceBiometricHelper.calculateSimilarity(v, preliminaryMean) >= 0.45f
+                }
+                val finalPool = if (validVectors.isNotEmpty()) validVectors else vectors
+
+                val mv = FloatArray(dim)
+                for (v in finalPool) {
+                    for (i in 0 until dim) mv[i] += v[i]
+                }
+                for (i in 0 until dim) {
+                    mv[i] /= finalPool.size.toFloat()
+                }
+                FaceBiometricHelper.l2Normalize(mv)
+                mv
+            }
+
+            val masterJson = FaceBiometricHelper.serializeEmbedding(masterVector)
+            masterEmbeddingJson = masterJson
+
+            val finalBitmap = photoBitmap ?: Bitmap.createBitmap(400, 400, Bitmap.Config.ARGB_8888)
+            val photosDir = File(context.filesDir, "employee_photos")
+            if (!photosDir.exists()) photosDir.mkdirs()
+            val photoFile = File(photosDir, "emp_${System.currentTimeMillis()}.jpg")
+            FileOutputStream(photoFile).use { out ->
+                finalBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+            }
+            capturedPhotoPath = photoFile.absolutePath
+
+            delay(600)
+            onEnrollmentComplete(photoFile.absolutePath, masterJson)
+        }
+    }
+
+    fun triggerInstantCapture() {
+        val face = latestDetectedFace
+        val bmp = latestFrameBitmap
+        if (face != null && bmp != null && !isComplete && !isCapturingInstant) {
+            isCapturingInstant = true
+            coroutineScope.launch {
+                val alignedCrop = FaceBiometricHelper.alignAndCropFace(bmp, face)
+                val vector = if (alignedCrop != null) {
+                    FaceBiometricHelper.extractFeatureVector(face, alignedCrop, context)
+                } else FloatArray(0)
+                alignedCrop?.recycle()
+
+                if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
+                    collectedVectors.add(vector)
+                    enrollmentProgress = 1.0f
+                    currentInstruction = "Wajah berhasil diambil! Menyimpan data..."
+                    finishEnrollment(collectedVectors, bmp)
+                } else {
+                    currentInstruction = "Posisikan wajah lebih jelas lalu coba lagi"
+                    isCapturingInstant = false
+                }
+            }
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose {
             faceDetector.close()
             cameraExecutor.shutdown()
             audioHelper.release()
+            latestFrameBitmap?.recycle()
+            bestSnapshotBitmap?.recycle()
         }
     }
 
@@ -111,7 +195,7 @@ fun FaceIdEnrollmentDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xFF0F172A)) // Dark immersive Apple Face ID backdrop
+                .background(Color(0xFF0F172A))
         ) {
             // 1. Camera Preview
             AndroidView(
@@ -146,113 +230,75 @@ fun FaceIdEnrollmentDialog(
                                                 val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() } ?: faces.first()
                                                 val box = face.boundingBox
 
-                                                // Pose & Quality Check: Frame yang jelek dibuang
-                                                val isGoodSize = box.width() >= 180 && box.height() >= 180
+                                                // Forgiving, comfortable face geometry
+                                                val isGoodSize = box.width() >= 75 && box.height() >= 75
                                                 val yaw = Math.abs(face.headEulerAngleY)
                                                 val roll = Math.abs(face.headEulerAngleZ)
-                                                val isGoodPose = yaw <= 22f && roll <= 18f
-                                                isFaceInsideCircle = isGoodSize
+                                                val isGoodPose = yaw <= 32f && roll <= 25f
 
-                                                if (isGoodSize && isGoodPose && enrollmentProgress < 1.0f) {
-                                                    val now = System.currentTimeMillis()
-                                                    if (now - lastCollectionTime >= 90) {
-                                                        lastCollectionTime = now
+                                                if (!isGoodSize) {
+                                                    isFaceInsideCircle = false
+                                                    currentInstruction = "Dekatkan wajah sedikit ke kamera"
+                                                } else if (roll > 25f) {
+                                                    isFaceInsideCircle = false
+                                                    currentInstruction = "Posisikan kepala tegak (tidak miring)"
+                                                } else if (yaw > 32f) {
+                                                    isFaceInsideCircle = false
+                                                    currentInstruction = "Hadap lurus ke arah kamera"
+                                                } else {
+                                                    isFaceInsideCircle = true
+                                                    val frameIdx = (collectedVectors.size + 1).coerceAtMost(TARGET_ENROLLMENT_FRAMES)
+                                                    currentInstruction = "Wajah terdeteksi! Tahan posisi... ($frameIdx/$TARGET_ENROLLMENT_FRAMES)"
+                                                }
 
-                                                        // Extract aligned canonical crop for MobileFaceNet
-                                                        val frameBmp = try {
-                                                            val bmp = imageProxy.toBitmap()
-                                                            if (rotation != 0) {
-                                                                val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                                                                val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                                                                if (rotBmp != bmp) bmp.recycle()
-                                                                rotBmp
-                                                            } else bmp
-                                                        } catch (_: Exception) {
-                                                            null
-                                                        }
+                                                val now = System.currentTimeMillis()
+                                                if (now - lastCollectionTime >= 120) {
+                                                    lastCollectionTime = now
 
-                                                        val alignedCrop = if (frameBmp != null) {
-                                                            FaceBiometricHelper.alignAndCropFace(frameBmp, face)
-                                                        } else null
+                                                    val frameBmp = try {
+                                                        val bmp = imageProxy.toBitmap()
+                                                        if (rotation != 0) {
+                                                            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                                                            val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                                                            if (rotBmp != bmp) bmp.recycle()
+                                                            rotBmp
+                                                        } else bmp
+                                                    } catch (_: Exception) {
+                                                        null
+                                                    }
 
-                                                        val vector = if (alignedCrop != null) {
-                                                            FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
-                                                        } else FloatArray(0)
+                                                    if (frameBmp != null) {
+                                                        latestDetectedFace = face
+                                                        latestFrameBitmap?.recycle()
+                                                        latestFrameBitmap = Bitmap.createBitmap(frameBmp)
 
-                                                        // Discard corrupt or non-MobileFaceNet dimension frames
-                                                        if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
-                                                            collectedVectors.add(vector)
+                                                        if (isGoodSize && isGoodPose && enrollmentProgress < 1.0f && !isComplete) {
+                                                            val alignedCrop = FaceBiometricHelper.alignAndCropFace(frameBmp, face)
+                                                            val vector = if (alignedCrop != null) {
+                                                                FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
+                                                            } else FloatArray(0)
 
-                                                            // Grab snapshot bitmap for profile avatar
-                                                            if (bestSnapshotBitmap == null && enrollmentProgress > 0.4f && frameBmp != null) {
-                                                                bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
-                                                            }
+                                                            if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
+                                                                collectedVectors.add(vector)
 
-                                                            val newProg = (collectedVectors.size / 45f).coerceIn(0f, 1f)
-                                                            enrollmentProgress = newProg
+                                                                if (bestSnapshotBitmap == null && yaw <= 15f && roll <= 12f) {
+                                                                    bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
+                                                                }
 
-                                                            currentInstruction = when {
-                                                                newProg < 0.25f -> "Silakan kedipkan mata..."
-                                                                newProg < 0.50f -> "Menoleh sedikit ke kiri..."
-                                                                newProg < 0.75f -> "Menoleh sedikit ke kanan..."
-                                                                newProg < 0.95f -> "Tatap lurus kembali..."
-                                                                else -> "Selesai! Memproses data biometrik..."
-                                                            }
+                                                                val newProg = (collectedVectors.size.toFloat() / TARGET_ENROLLMENT_FRAMES).coerceIn(0f, 1f)
+                                                                enrollmentProgress = newProg
 
-                                                            if (newProg >= 1.0f && !isComplete) {
-                                                                isComplete = true
-                                                                coroutineScope.launch {
-                                                                    audioHelper.playSuccessBeep()
-
-                                                                    // Outlier Rejection: Buang frame jelek sebelum digabung
-                                                                    val dim = FaceBiometricHelper.EMBEDDING_DIM
-                                                                    val preliminaryMean = FloatArray(dim)
-                                                                    for (v in collectedVectors) {
-                                                                        for (i in 0 until dim) preliminaryMean[i] += v[i]
-                                                                    }
-                                                                    FaceBiometricHelper.l2Normalize(preliminaryMean)
-
-                                                                    // Filter out vectors whose similarity with mean is below 0.65 (outlier/blur)
-                                                                    val validVectors = collectedVectors.filter { v ->
-                                                                        FaceBiometricHelper.calculateSimilarity(v, preliminaryMean) >= 0.65f
-                                                                    }
-                                                                    val finalPool = if (validVectors.size >= 15) validVectors else collectedVectors
-
-                                                                    val masterVector = FloatArray(dim)
-                                                                    for (v in finalPool) {
-                                                                        for (i in 0 until dim) masterVector[i] += v[i]
-                                                                    }
-                                                                    for (i in 0 until dim) {
-                                                                        masterVector[i] /= finalPool.size.toFloat()
-                                                                    }
-                                                                    FaceBiometricHelper.l2Normalize(masterVector)
-
-                                                                    val masterJson = FaceBiometricHelper.serializeEmbedding(masterVector)
-                                                                    masterEmbeddingJson = masterJson
-
-                                                                    // Save snapshot bitmap
-                                                                    val finalBitmap = bestSnapshotBitmap ?: Bitmap.createBitmap(400, 400, Bitmap.Config.ARGB_8888)
-                                                                    val photosDir = File(context.filesDir, "employee_photos")
-                                                                    if (!photosDir.exists()) photosDir.mkdirs()
-                                                                    val photoFile = File(photosDir, "emp_${System.currentTimeMillis()}.jpg")
-                                                                    FileOutputStream(photoFile).use { out ->
-                                                                        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
-                                                                    }
-                                                                    capturedPhotoPath = photoFile.absolutePath
-
-                                                                    delay(600)
-                                                                    onEnrollmentComplete(photoFile.absolutePath, masterJson)
+                                                                if (newProg >= 1.0f && !isComplete) {
+                                                                    currentInstruction = "Selesai! Menyimpan data biometrik..."
+                                                                    finishEnrollment(collectedVectors, bestSnapshotBitmap ?: latestFrameBitmap)
                                                                 }
                                                             }
+
+                                                            alignedCrop?.recycle()
                                                         }
 
-                                                        alignedCrop?.recycle()
-                                                        frameBmp?.recycle()
+                                                        frameBmp.recycle()
                                                     }
-                                                } else if (!isGoodSize) {
-                                                    currentInstruction = "Dekatkan wajah ke dalam lingkaran"
-                                                } else if (!isGoodPose) {
-                                                    currentInstruction = "Tatap lurus ke arah kamera"
                                                 }
                                             } else {
                                                 isFaceInsideCircle = false
@@ -294,10 +340,10 @@ fun FaceIdEnrollmentDialog(
 
             // 2. Dark Overlay with Circular Cutout (Apple Face ID aesthetic)
             Canvas(modifier = Modifier.fillMaxSize()) {
-                val center = Offset(size.width / 2f, size.height * 0.42f)
+                val center = Offset(size.width / 2f, size.height * 0.40f)
                 val radius = size.width * 0.36f
 
-                // Draw 60 surrounding radial tick segments
+                // Draw 48 surrounding radial tick segments
                 val totalTicks = 48
                 val activeTicks = (enrollmentProgress * totalTicks).toInt()
 
@@ -356,6 +402,7 @@ fun FaceIdEnrollmentDialog(
                     modifier = Modifier
                         .size(42.dp)
                         .background(Color.Black.copy(alpha = 0.45f), CircleShape)
+                        .testTag("close_face_enrollment_button")
                 ) {
                     Icon(Icons.Default.Close, contentDescription = "Tutup", tint = Color.White)
                 }
@@ -366,7 +413,7 @@ fun FaceIdEnrollmentDialog(
                     border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.20f))
                 ) {
                     Text(
-                        text = "Apple Face ID Enrollment",
+                        text = "Face ID Enrollment",
                         color = Color.White,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -379,22 +426,27 @@ fun FaceIdEnrollmentDialog(
                     modifier = Modifier
                         .size(42.dp)
                         .background(Color.Black.copy(alpha = 0.45f), CircleShape)
+                        .testTag("switch_camera_face_enrollment_button")
                 ) {
                     Icon(Icons.Default.FlipCameraAndroid, contentDescription = "Ganti Kamera", tint = Color.White)
                 }
             }
 
-            // 4. Bottom Guidance & Progress Panel
+            // 4. Bottom Guidance & Quick-Capture Panel
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .align(Alignment.BottomCenter)
                     .background(
                         Brush.verticalGradient(
-                            colors = listOf(Color.Transparent, Color(0xFF0F172A).copy(alpha = 0.95f), Color(0xFF0F172A))
+                            colors = listOf(
+                                Color.Transparent,
+                                Color(0xFF0F172A).copy(alpha = 0.95f),
+                                Color(0xFF0F172A)
+                            )
                         )
                     )
-                    .padding(horizontal = 24.dp, vertical = 32.dp),
+                    .padding(horizontal = 24.dp, vertical = 28.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 // Success Badge or Scanning Status
@@ -425,7 +477,7 @@ fun FaceIdEnrollmentDialog(
                     Text(
                         text = if (employeeName.isNotBlank()) "Mendaftarkan Wajah: $employeeName" else "Pindai Wajah Karyawan",
                         color = Color.White,
-                        fontSize = 18.sp,
+                        fontSize = 17.sp,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(6.dp))
@@ -437,7 +489,7 @@ fun FaceIdEnrollmentDialog(
                         textAlign = TextAlign.Center
                     )
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(14.dp))
 
                     // Progress Bar (0% - 100%)
                     Row(
@@ -460,6 +512,42 @@ fun FaceIdEnrollmentDialog(
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold
                         )
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Quick-Action Instant Capture Button (Solves "daftarin susah" completely!)
+                    Button(
+                        onClick = { triggerInstantCapture() },
+                        enabled = latestDetectedFace != null && !isCapturingInstant,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF0284C7),
+                            disabledContainerColor = Color.White.copy(alpha = 0.12f)
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth(0.85f)
+                            .height(46.dp)
+                            .testTag("instant_capture_face_button")
+                    ) {
+                        if (isCapturingInstant) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Menyimpan...", color = Color.White, fontSize = 13.sp)
+                        } else {
+                            Icon(Icons.Default.CameraAlt, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Ambil Wajah Sekarang (Instan)",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
                     }
                 }
             }
