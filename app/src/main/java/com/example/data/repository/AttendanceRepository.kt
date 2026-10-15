@@ -104,24 +104,46 @@ class AttendanceRepository(context: Context) {
 
     suspend fun ensureEmployeeEmbeddings(context: Context, employees: List<Employee>) {
         withContext(Dispatchers.IO) {
-            val existingTemplates = biometricTemplateDao.getAllTemplatesDirect().associateBy { it.employeeId }
+            com.example.util.FaceBiometricHelper.init(context)
+            val existingTemplates = biometricTemplateDao.getAllTemplatesDirect().groupBy { it.employeeId }
             for (emp in employees) {
-                var json = emp.faceEmbedding
-                if (json.isNullOrBlank() && !emp.photoUri.isNullOrBlank()) {
-                    val embedding = com.example.util.FaceBiometricHelper.extractEmbeddingFromUri(context, emp.photoUri)
-                    if (embedding != null) {
-                        json = com.example.util.FaceBiometricHelper.serializeEmbedding(embedding)
-                        employeeDao.updateEmployee(emp.copy(faceEmbedding = json))
-                    }
-                }
+                var currentVec = com.example.util.FaceBiometricHelper.deserializeEmbedding(emp.faceEmbedding)
+                val isOldFormat = currentVec != null && currentVec.size != com.example.util.FaceBiometricHelper.EMBEDDING_DIM
+                val isMissing = currentVec == null || currentVec.isEmpty()
 
-                if (!json.isNullOrBlank()) {
-                    val existing = existingTemplates[emp.id]
-                    if (existing == null || existing.embeddingJson != json) {
+                // If old format or missing, re-extract from profile photo
+                if ((isOldFormat || isMissing) && !emp.photoUri.isNullOrBlank()) {
+                    val newVec = com.example.util.FaceBiometricHelper.extractEmbeddingFromUri(context, emp.photoUri)
+                    if (newVec != null && newVec.size == com.example.util.FaceBiometricHelper.EMBEDDING_DIM) {
+                        val encryptedJson = com.example.util.FaceBiometricHelper.serializeEmbedding(newVec)
+                        employeeDao.updateEmployee(emp.copy(faceEmbedding = encryptedJson))
+                        biometricTemplateDao.deleteTemplatesByEmployeeId(emp.id)
                         biometricTemplateDao.insertTemplate(
                             BiometricTemplate(
                                 employeeId = emp.id,
-                                embeddingJson = json,
+                                embeddingJson = encryptedJson,
+                                qualityScore = 1.0f,
+                                angleType = "MASTER_FUSION"
+                            )
+                        )
+                        currentVec = newVec
+                    }
+                } else if (isOldFormat) {
+                    // Cannot recreate from photo, discard old format to prevent false matches
+                    biometricTemplateDao.deleteTemplatesByEmployeeId(emp.id)
+                    employeeDao.updateEmployee(emp.copy(faceEmbedding = null))
+                } else if (currentVec != null && currentVec.size == com.example.util.FaceBiometricHelper.EMBEDDING_DIM) {
+                    val userTemplates = existingTemplates[emp.id]
+                    val hasValidTemplate = userTemplates?.any {
+                        val v = com.example.util.FaceBiometricHelper.deserializeEmbedding(it.embeddingJson)
+                        v != null && v.size == com.example.util.FaceBiometricHelper.EMBEDDING_DIM
+                    } == true
+                    if (!hasValidTemplate) {
+                        biometricTemplateDao.deleteTemplatesByEmployeeId(emp.id)
+                        biometricTemplateDao.insertTemplate(
+                            BiometricTemplate(
+                                employeeId = emp.id,
+                                embeddingJson = emp.faceEmbedding!!,
                                 qualityScore = 1.0f,
                                 angleType = "MASTER_FUSION"
                             )
@@ -134,65 +156,77 @@ class AttendanceRepository(context: Context) {
 
     /**
      * Matches live biometric face vector against registered employees' biometric templates.
-     * Uses strict Employee ID mapping (via relational Map<Long, Employee>) to prevent index-based mismatch.
-     * Returns the best matching Employee and similarity score (0.0 - 1.0) ONLY if genuine match above threshold
-     * with strong Top-1 vs Top-2 margin separation to scale reliably to hundreds of employees.
+     * Computes similarity score per person and requires Top-1 vs Top-2 margin separation >= 0.08.
+     * Threshold defaults to 0.70 and is strictly enforced to be at least 0.60.
+     * Ignores old format templates safely.
      */
     fun findBestMatchingEmployee(
         liveBiometricVector: FloatArray,
         employees: List<Employee>,
-        threshold: Float = 0.85f,
+        threshold: Float = 0.70f,
         templates: List<BiometricTemplate>? = null
     ): Pair<Employee, Float>? {
         if (employees.isEmpty() || liveBiometricVector.isEmpty()) return null
+        if (liveBiometricVector.size != com.example.util.FaceBiometricHelper.EMBEDDING_DIM) return null
 
-        val employeeById = employees.associateBy { it.id }
-        var bestMatchEmployee: Employee? = null
-        var highestScore = 0f
-        var secondHighestScore = 0f
+        val minAcceptableThreshold = maxOf(0.60f, if (threshold > 0f) threshold else 0.70f)
+        val templatesByEmployeeId = templates?.groupBy { it.employeeId } ?: emptyMap()
 
-        if (!templates.isNullOrEmpty()) {
-            // Match against dedicated BiometricTemplate entities mapped strictly to employeeId
-            for (tpl in templates) {
-                val emp = employeeById[tpl.employeeId] ?: continue
-                val tplEmbedding = com.example.util.FaceBiometricHelper.deserializeEmbedding(tpl.embeddingJson) ?: continue
-                val score = com.example.util.FaceBiometricHelper.calculateSimilarity(liveBiometricVector, tplEmbedding)
+        // Skor dihitung per orang (ambil skor terbaik per masing-masing karyawan)
+        val scoredCandidates = mutableListOf<Pair<Employee, Float>>()
 
-                if (score > highestScore) {
-                    secondHighestScore = highestScore
-                    highestScore = score
-                    bestMatchEmployee = emp
-                } else if (score > secondHighestScore) {
-                    secondHighestScore = score
+        for (emp in employees) {
+            var bestScoreForThisPerson = -1f
+
+            // Check employee's dedicated biometric templates
+            val empTemplates = templatesByEmployeeId[emp.id]
+            if (!empTemplates.isNullOrEmpty()) {
+                for (tpl in empTemplates) {
+                    val tplVec = com.example.util.FaceBiometricHelper.deserializeEmbedding(tpl.embeddingJson) ?: continue
+                    // Discard old format embeddings
+                    if (tplVec.size != com.example.util.FaceBiometricHelper.EMBEDDING_DIM) continue
+
+                    val score = com.example.util.FaceBiometricHelper.calculateSimilarity(liveBiometricVector, tplVec)
+                    if (score > bestScoreForThisPerson) {
+                        bestScoreForThisPerson = score
+                    }
                 }
             }
-        } else {
-            // Direct employee embedded fallback
-            for (emp in employees) {
-                val empEmbedding = com.example.util.FaceBiometricHelper.deserializeEmbedding(emp.faceEmbedding) ?: continue
-                val score = com.example.util.FaceBiometricHelper.calculateSimilarity(liveBiometricVector, empEmbedding)
 
-                if (score > highestScore) {
-                    secondHighestScore = highestScore
-                    highestScore = score
-                    bestMatchEmployee = emp
-                } else if (score > secondHighestScore) {
-                    secondHighestScore = score
+            // Fallback to employee.faceEmbedding if not in templates
+            if (bestScoreForThisPerson < 0f && !emp.faceEmbedding.isNullOrBlank()) {
+                val empVec = com.example.util.FaceBiometricHelper.deserializeEmbedding(emp.faceEmbedding)
+                if (empVec != null && empVec.size == com.example.util.FaceBiometricHelper.EMBEDDING_DIM) {
+                    val score = com.example.util.FaceBiometricHelper.calculateSimilarity(liveBiometricVector, empVec)
+                    if (score > bestScoreForThisPerson) {
+                        bestScoreForThisPerson = score
+                    }
                 }
+            }
+
+            if (bestScoreForThisPerson >= 0f) {
+                scoredCandidates.add(Pair(emp, bestScoreForThisPerson))
             }
         }
 
-        val minAcceptableThreshold = if (threshold > 0f) threshold else 0.85f
+        if (scoredCandidates.isEmpty()) return null
 
-        // Top-1 vs Top-2 Margin Isolation:
-        val hasClearWinner = if (employees.size > 1 && secondHighestScore > 0f) {
-            (highestScore - secondHighestScore >= 0.05f) || (highestScore >= 0.92f)
+        // Sort descending by highest similarity score
+        scoredCandidates.sortByDescending { it.second }
+
+        val top1 = scoredCandidates[0]
+        val highestScore = top1.second
+        val secondHighestScore = if (scoredCandidates.size > 1) scoredCandidates[1].second else 0f
+
+        // Harus jelas lebih tinggi dari orang kedua (selisih minimal 0.08)
+        val hasClearWinner = if (scoredCandidates.size > 1 && secondHighestScore > 0f) {
+            (highestScore - secondHighestScore) >= 0.08f
         } else {
             true
         }
 
-        return if (bestMatchEmployee != null && highestScore >= minAcceptableThreshold && hasClearWinner) {
-            Pair(bestMatchEmployee, highestScore)
+        return if (highestScore >= minAcceptableThreshold && hasClearWinner) {
+            Pair(top1.first, highestScore)
         } else {
             null
         }

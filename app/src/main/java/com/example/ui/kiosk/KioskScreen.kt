@@ -224,8 +224,23 @@ fun KioskScreen(
                 onFaceBiometricsInfo = { faceInfo, liveVector ->
                     isLiveFaceDetected = true
                     lastFaceDetectionTime = System.currentTimeMillis()
-                    isSpoofDetected = false
 
+                    // 1. Anti Foto Palsu (Liveness)
+                    // Orang harus berkedip atau tersenyum dulu sebelum wajahnya dikenali.
+                    // Foto diam tidak bisa lolos.
+                    val (livenessStatus, hintText) = antiSpoofTracker.evaluate(faceInfo)
+                    livenessHint = hintText
+                    isSpoofDetected = livenessStatus == FaceBiometricHelper.LivenessStatus.SUSPECTED_SPOOF_PHOTO
+
+                    if (!antiSpoofTracker.isLiveVerified) {
+                        scanMatchCount = 0
+                        scanCandidateId = null
+                        scanCandidateName = ""
+                        scanProgress = 0f
+                        return@LiveCameraPreview
+                    }
+
+                    // 2. Pemindaian & Logika 10 Frame
                     if (employees.isNotEmpty() && selectedEmployee == null) {
                         val match = repository.findBestMatchingEmployee(
                             liveBiometricVector = liveVector,
@@ -241,6 +256,7 @@ fun KioskScreen(
                             if (scanCandidateId == emp.id) {
                                 scanMatchCount++
                             } else {
+                                // Kalau orangnya ganti atau kandidat berubah, hitungan mulai dari nol
                                 scanCandidateId = emp.id
                                 scanCandidateName = emp.name
                                 scanMatchCount = 1
@@ -248,8 +264,8 @@ fun KioskScreen(
 
                             scanProgress = (scanMatchCount / 10f).coerceIn(0f, 1f)
 
-                            // Require 10 consistent frames (~1.5 seconds) to thoroughly scan and recognize facial contours
-                            if (scanMatchCount >= 10 || conf >= 0.95f) {
+                            // Jalan pintas skor tinggi dihapus: harus 10 frame konsisten
+                            if (scanMatchCount >= 10) {
                                 selectedEmployee = emp
                                 matchConfidenceScore = conf
                                 isUnrecognizedFace = false
@@ -308,7 +324,9 @@ fun KioskScreen(
                 .scale(scanPulseScale)
         ) {
             val bracketColor = when {
+                isSpoofDetected -> Color(0xFFEF4444)
                 selectedEmployee != null -> AccentGreen
+                !antiSpoofTracker.isLiveVerified && isLiveFaceDetected -> AccentAmber
                 isUnrecognizedFace && isLiveFaceDetected -> AccentAmber
                 isLiveFaceDetected -> PrimaryNavy
                 else -> PrimaryNavy.copy(alpha = 0.6f)
@@ -340,7 +358,8 @@ fun KioskScreen(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .offset(y = 20.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Surface(
                     shape = RoundedCornerShape(20.dp),
@@ -349,7 +368,7 @@ fun KioskScreen(
                     shadowElevation = 4.dp
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
@@ -361,12 +380,14 @@ fun KioskScreen(
                                 contentScale = ContentScale.Crop
                             )
                         } else {
-                            val dotColor = if (selectedEmployee != null) AccentGreen else if (isUnrecognizedFace) AccentAmber else PrimaryNavy
+                            val dotColor = if (selectedEmployee != null) AccentGreen else if (isSpoofDetected) Color(0xFFEF4444) else if (isUnrecognizedFace || (!antiSpoofTracker.isLiveVerified && isLiveFaceDetected)) AccentAmber else PrimaryNavy
                             Box(modifier = Modifier.size(8.dp).background(dotColor, CircleShape))
                         }
 
                         val statusLabel = when {
+                            isSpoofDetected -> "⛔ Foto Diam Terdeteksi (Silakan kedip/senyum)"
                             selectedEmployee != null -> "Wajah Cocok: ${selectedEmployee!!.name} (${(matchConfidenceScore * 100).toInt()}%)"
+                            !antiSpoofTracker.isLiveVerified && isLiveFaceDetected -> livenessHint ?: "👁️ Silakan Berkedip atau Tersenyum"
                             scanProgress > 0f && scanCandidateName.isNotEmpty() -> "Memindai Kontur: $scanCandidateName (${(scanProgress * 100).toInt()}%)..."
                             isUnrecognizedFace && isLiveFaceDetected -> "Wajah Belum Terdaftar"
                             isLiveFaceDetected -> "Mengenali Kontur Wajah..."
@@ -379,6 +400,15 @@ fun KioskScreen(
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
+
+                        if (scanProgress > 0f && scanProgress < 1f) {
+                            LinearProgressIndicator(
+                                progress = { scanProgress },
+                                modifier = Modifier.width(60.dp).height(4.dp).clip(RoundedCornerShape(2.dp)),
+                                color = PrimaryNavy,
+                                trackColor = CardBorderLight
+                            )
+                        }
                     }
                 }
             }

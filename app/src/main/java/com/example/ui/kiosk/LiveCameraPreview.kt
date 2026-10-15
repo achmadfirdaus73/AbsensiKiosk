@@ -150,7 +150,7 @@ fun LiveCameraPreview(
                                                     FaceBiometricHelper.alignAndCropFace(frameBitmap, faceInfo)
                                                 } else null
 
-                                                val vector = FaceBiometricHelper.extractFeatureVector(faceInfo, alignedCrop)
+                                                val vector = FaceBiometricHelper.extractFeatureVector(faceInfo, alignedCrop, ctx)
                                                 alignedCrop?.recycle()
                                                 frameBitmap?.recycle()
 
@@ -170,69 +170,11 @@ fun LiveCameraPreview(
 
                                         if (isDownloading) {
                                             onModelDownloadStatusChanged(true)
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastLogTime > 6000) {
-                                                Log.i("LiveCameraPreview", "ML Kit Face module downloading... Running high-speed native fallback detector.")
-                                                lastLogTime = now
-                                            }
-
-                                            // Run fast native fallback detector directly from current camera frame
-                                            try {
-                                                val rawBitmap = imageProxy.toBitmap()
-                                                val frameBitmap = if (rotation != 0) {
-                                                    val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
-                                                    val rot = android.graphics.Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
-                                                    if (rot != rawBitmap) rawBitmap.recycle()
-                                                    rot
-                                                } else rawBitmap
-
-                                                val nativeFace = FaceBiometricHelper.detectFaceNative(frameBitmap)
-                                                if (nativeFace != null) {
-                                                    val previewWidth = previewView.width.toFloat()
-                                                    val previewHeight = previewView.height.toFloat()
-                                                    val uprightWidth = frameBitmap.width.toFloat()
-                                                    val uprightHeight = frameBitmap.height.toFloat()
-
-                                                    if (previewWidth > 0 && previewHeight > 0 && uprightWidth > 0 && uprightHeight > 0) {
-                                                        val scale = max(previewWidth / uprightWidth, previewHeight / uprightHeight)
-                                                        val offsetX = (previewWidth - uprightWidth * scale) / 2f
-                                                        val offsetY = (previewHeight - uprightHeight * scale) / 2f
-                                                        val box = nativeFace.boundingBox
-
-                                                        val tracked = if (useFrontCamera) {
-                                                            val l = previewWidth - (box.right * scale + offsetX)
-                                                            val r = previewWidth - (box.left * scale + offsetX)
-                                                            val t = box.top * scale + offsetY
-                                                            val b = box.bottom * scale + offsetY
-                                                            RectF(l, t, r, b)
-                                                        } else {
-                                                            val l = box.left * scale + offsetX
-                                                            val r = box.right * scale + offsetX
-                                                            val t = box.top * scale + offsetY
-                                                            val b = box.bottom * scale + offsetY
-                                                            RectF(l, t, r, b)
-                                                        }
-                                                        onFaceBoundsTracked(tracked)
-                                                    }
-
-                                                    val alignedCrop = FaceBiometricHelper.alignAndCropFace(frameBitmap, nativeFace)
-                                                    val vector = FaceBiometricHelper.extractFeatureVector(nativeFace, alignedCrop)
-                                                    alignedCrop?.recycle()
-
-                                                    onFaceBiometricsInfo(nativeFace, vector)
-                                                } else {
-                                                    onFaceBoundsTracked(null)
-                                                }
-                                                frameBitmap.recycle()
-                                            } catch (ex: Exception) {
-                                                Log.w("LiveCameraPreview", "Native fallback notice: ${ex.message}")
-                                            }
-                                        } else {
-                                            val now = System.currentTimeMillis()
-                                            if (now - lastLogTime > 6000) {
-                                                Log.w("LiveCameraPreview", "Camera face analysis notice: ${e.message}")
-                                                lastLogTime = now
-                                            }
+                                        }
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastLogTime > 6000) {
+                                            Log.w("LiveCameraPreview", "Camera face analysis notice: ${e.message}")
+                                            lastLogTime = now
                                         }
                                     }
                                     .addOnCompleteListener {

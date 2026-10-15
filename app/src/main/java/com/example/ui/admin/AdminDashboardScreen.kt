@@ -878,6 +878,58 @@ fun KioskSettingsTab(
             }
         }
 
+        // Pengaturan Biometrik & Face Recognition (MobileFaceNet)
+        Card(
+            modifier = Modifier.fillMaxWidth().shadow(2.dp, RoundedCornerShape(12.dp)),
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(containerColor = PureWhite),
+            border = androidx.compose.foundation.BorderStroke(1.dp, CardBorderLight)
+        ) {
+            Column(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Icon(Icons.Default.Security, contentDescription = null, tint = PrimaryNavy, modifier = Modifier.size(20.dp))
+                    Text("Pengenalan Wajah & Ambang Biometrik", color = TextPrimaryLight, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                }
+
+                Text(
+                    text = "Batas skor pencocokan MobileFaceNet (Default: 0.70, Minimal: 0.60). Sistem mewajibkan selisih skor minimal 0.08 dari kandidat kedua demi presisi 100%.",
+                    color = TextSecondaryLight,
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Ambang Kecocokan:", color = TextPrimaryLight, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("${(confidenceThreshold.coerceIn(0.60f, 0.95f) * 100).toInt()}%", color = PrimaryNavy, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                }
+
+                Slider(
+                    value = confidenceThreshold.coerceIn(0.60f, 0.95f),
+                    onValueChange = { confidenceThreshold = it.coerceIn(0.60f, 0.95f) },
+                    valueRange = 0.60f..0.95f,
+                    steps = 6,
+                    colors = SliderDefaults.colors(
+                        thumbColor = PrimaryNavy,
+                        activeTrackColor = PrimaryNavy,
+                        inactiveTrackColor = CardBorderLight
+                    )
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("0.60 (Min)", color = TextSecondaryLight, fontSize = 11.sp)
+                    Text("0.70 (Standar)", color = TextSecondaryLight, fontSize = 11.sp)
+                    Text("0.95 (Ketat)", color = TextSecondaryLight, fontSize = 11.sp)
+                }
+            }
+        }
+
         // 2. Master Shift
         Card(
             modifier = Modifier.fillMaxWidth().shadow(2.dp, RoundedCornerShape(12.dp)),
@@ -1071,7 +1123,7 @@ fun KioskSettingsTab(
                     longitude = longitude,
                     radiusMeters = radiusMeters,
                     kioskPin = kioskPin.trim(),
-                    faceConfidenceThreshold = confidenceThreshold,
+                    faceConfidenceThreshold = confidenceThreshold.coerceIn(0.60f, 0.95f),
                     shift1Start = shift1Start.trim(),
                     shift1End = shift1End.trim(),
                     shift2Start = shift2Start.trim(),

@@ -146,90 +146,113 @@ fun FaceIdEnrollmentDialog(
                                                 val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() } ?: faces.first()
                                                 val box = face.boundingBox
 
-                                                // Check if face is well-centered and of good size
-                                                val isGoodSize = box.width() > 180 && box.height() > 180
+                                                // Pose & Quality Check: Frame yang jelek dibuang
+                                                val isGoodSize = box.width() >= 180 && box.height() >= 180
+                                                val yaw = Math.abs(face.headEulerAngleY)
+                                                val roll = Math.abs(face.headEulerAngleZ)
+                                                val isGoodPose = yaw <= 22f && roll <= 18f
                                                 isFaceInsideCircle = isGoodSize
 
-                                                if (isGoodSize && enrollmentProgress < 1.0f) {
-                                                    // Extract aligned canonical crop for higher-accuracy master embedding
-                                                    val frameBmp = try {
-                                                        val bmp = imageProxy.toBitmap()
-                                                        if (rotation != 0) {
-                                                            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                                                            val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                                                            if (rotBmp != bmp) bmp.recycle()
-                                                            rotBmp
-                                                        } else bmp
-                                                    } catch (_: Exception) {
-                                                        null
-                                                    }
+                                                if (isGoodSize && isGoodPose && enrollmentProgress < 1.0f) {
+                                                    val now = System.currentTimeMillis()
+                                                    if (now - lastCollectionTime >= 90) {
+                                                        lastCollectionTime = now
 
-                                                    val alignedCrop = if (frameBmp != null) {
-                                                        FaceBiometricHelper.alignAndCropFace(frameBmp, face)
-                                                    } else null
+                                                        // Extract aligned canonical crop for MobileFaceNet
+                                                        val frameBmp = try {
+                                                            val bmp = imageProxy.toBitmap()
+                                                            if (rotation != 0) {
+                                                                val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                                                                val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                                                                if (rotBmp != bmp) bmp.recycle()
+                                                                rotBmp
+                                                            } else bmp
+                                                        } catch (_: Exception) {
+                                                            null
+                                                        }
 
-                                                    val vector = FaceBiometricHelper.extractFeatureVector(face, alignedCrop)
-                                                    collectedVectors.add(vector)
+                                                        val alignedCrop = if (frameBmp != null) {
+                                                            FaceBiometricHelper.alignAndCropFace(frameBmp, face)
+                                                        } else null
 
-                                                    // Grab a clean frame snapshot for profile avatar
-                                                    if (bestSnapshotBitmap == null && enrollmentProgress > 0.4f && frameBmp != null) {
-                                                        bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
-                                                    }
+                                                        val vector = if (alignedCrop != null) {
+                                                            FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
+                                                        } else FloatArray(0)
 
-                                                    alignedCrop?.recycle()
-                                                    frameBmp?.recycle()
+                                                        // Discard corrupt or non-MobileFaceNet dimension frames
+                                                        if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
+                                                            collectedVectors.add(vector)
 
-                                                                                                                                                                                                                   val newProg = (collectedVectors.size / 60f).coerceIn(0f, 1f)
-                                                    enrollmentProgress = newProg
+                                                            // Grab snapshot bitmap for profile avatar
+                                                            if (bestSnapshotBitmap == null && enrollmentProgress > 0.4f && frameBmp != null) {
+                                                                bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
+                                                            }
 
-                                                    currentInstruction = when {
-                                                        newProg < 0.25f -> "Silakan kedipkan mata..."
-                                                        newProg < 0.50f -> "Menoleh sedikit ke kiri..."
-                                                        newProg < 0.75f -> "Menoleh sedikit ke kanan..."
-                                                        newProg < 0.95f -> "Tatap lurus kembali..."
-                                                        else -> "Selesai!"
-                                                    }
+                                                            val newProg = (collectedVectors.size / 45f).coerceIn(0f, 1f)
+                                                            enrollmentProgress = newProg
 
-                                                    if (newProg >= 1.0f && !isComplete) {
-                                                        isComplete = true
-                                                        coroutineScope.launch {
-                                                            audioHelper.playSuccessBeep()
+                                                            currentInstruction = when {
+                                                                newProg < 0.25f -> "Silakan kedipkan mata..."
+                                                                newProg < 0.50f -> "Menoleh sedikit ke kiri..."
+                                                                newProg < 0.75f -> "Menoleh sedikit ke kanan..."
+                                                                newProg < 0.95f -> "Tatap lurus kembali..."
+                                                                else -> "Selesai! Memproses data biometrik..."
+                                                            }
 
-                                                            // Fuse collected multi-frame vectors into pristine master embedding
-                                                            val masterVector = FloatArray(128)
-                                                            for (v in collectedVectors) {
-                                                                for (i in 0 until 128) {
-                                                                    masterVector[i] += v[i]
+                                                            if (newProg >= 1.0f && !isComplete) {
+                                                                isComplete = true
+                                                                coroutineScope.launch {
+                                                                    audioHelper.playSuccessBeep()
+
+                                                                    // Outlier Rejection: Buang frame jelek sebelum digabung
+                                                                    val dim = FaceBiometricHelper.EMBEDDING_DIM
+                                                                    val preliminaryMean = FloatArray(dim)
+                                                                    for (v in collectedVectors) {
+                                                                        for (i in 0 until dim) preliminaryMean[i] += v[i]
+                                                                    }
+                                                                    FaceBiometricHelper.l2Normalize(preliminaryMean)
+
+                                                                    // Filter out vectors whose similarity with mean is below 0.65 (outlier/blur)
+                                                                    val validVectors = collectedVectors.filter { v ->
+                                                                        FaceBiometricHelper.calculateSimilarity(v, preliminaryMean) >= 0.65f
+                                                                    }
+                                                                    val finalPool = if (validVectors.size >= 15) validVectors else collectedVectors
+
+                                                                    val masterVector = FloatArray(dim)
+                                                                    for (v in finalPool) {
+                                                                        for (i in 0 until dim) masterVector[i] += v[i]
+                                                                    }
+                                                                    for (i in 0 until dim) {
+                                                                        masterVector[i] /= finalPool.size.toFloat()
+                                                                    }
+                                                                    FaceBiometricHelper.l2Normalize(masterVector)
+
+                                                                    val masterJson = FaceBiometricHelper.serializeEmbedding(masterVector)
+                                                                    masterEmbeddingJson = masterJson
+
+                                                                    // Save snapshot bitmap
+                                                                    val finalBitmap = bestSnapshotBitmap ?: Bitmap.createBitmap(400, 400, Bitmap.Config.ARGB_8888)
+                                                                    val photosDir = File(context.filesDir, "employee_photos")
+                                                                    if (!photosDir.exists()) photosDir.mkdirs()
+                                                                    val photoFile = File(photosDir, "emp_${System.currentTimeMillis()}.jpg")
+                                                                    FileOutputStream(photoFile).use { out ->
+                                                                        finalBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                                                                    }
+                                                                    capturedPhotoPath = photoFile.absolutePath
+
+                                                                    delay(600)
+                                                                    onEnrollmentComplete(photoFile.absolutePath, masterJson)
                                                                 }
                                                             }
-                                                            for (i in 0 until 128) {
-                                                                masterVector[i] /= collectedVectors.size.toFloat()
-                                                            }
-                                                            // Normalize master vector
-                                                            var sumSq = 0f
-                                                            for (valX in masterVector) sumSq += valX * valX
-                                                            val norm = kotlin.math.sqrt(maxOf(1e-8f, sumSq))
-                                                            for (i in 0 until 128) masterVector[i] /= norm
-
-                                                            val masterJson = FaceBiometricHelper.serializeEmbedding(masterVector)
-                                                            masterEmbeddingJson = masterJson
-
-                                                            // Save the snapshot bitmap
-                                                            val finalBitmap = bestSnapshotBitmap ?: Bitmap.createBitmap(400, 400, Bitmap.Config.ARGB_8888)
-                                                            val photosDir = File(context.filesDir, "employee_photos")
-                                                            if (!photosDir.exists()) photosDir.mkdirs()
-                                                            val photoFile = File(photosDir, "emp_${System.currentTimeMillis()}.jpg")
-                                                            FileOutputStream(photoFile).use { out ->
-                                                                finalBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
-                                                            }
-                                                            capturedPhotoPath = photoFile.absolutePath
-
-                                                            delay(800)
-                                                            onEnrollmentComplete(photoFile.absolutePath, masterJson)
                                                         }
+
+                                                        alignedCrop?.recycle()
+                                                        frameBmp?.recycle()
                                                     }
                                                 } else if (!isGoodSize) {
                                                     currentInstruction = "Dekatkan wajah ke dalam lingkaran"
+                                                } else if (!isGoodPose) {
+                                                    currentInstruction = "Tatap lurus ke arah kamera"
                                                 }
                                             } else {
                                                 isFaceInsideCircle = false
@@ -237,81 +260,7 @@ fun FaceIdEnrollmentDialog(
                                             }
                                         }
                                         .addOnFailureListener { e ->
-                                            // Handle module downloading with fast native fallback
-                                            try {
-                                                val bmp = imageProxy.toBitmap()
-                                                val frameBmp = if (rotation != 0) {
-                                                    val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                                                    val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                                                    if (rotBmp != bmp) bmp.recycle()
-                                                    rotBmp
-                                                } else bmp
-
-                                                val nativeFace = FaceBiometricHelper.detectFaceNative(frameBmp)
-                                                if (nativeFace != null) {
-                                                    val box = nativeFace.boundingBox
-                                                    val isGoodSize = box.width() > 160 && box.height() > 160
-                                                    isFaceInsideCircle = isGoodSize
-
-                                                    if (isGoodSize && enrollmentProgress < 1.0f) {
-                                                        val alignedCrop = FaceBiometricHelper.alignAndCropFace(frameBmp, nativeFace)
-                                                        val vector = FaceBiometricHelper.extractFeatureVector(nativeFace, alignedCrop)
-                                                        collectedVectors.add(vector)
-
-                                                        if (bestSnapshotBitmap == null && enrollmentProgress > 0.4f) {
-                                                            bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
-                                                        }
-                                                        alignedCrop?.recycle()
-
-                                                        val newProg = (collectedVectors.size / 36f).coerceIn(0f, 1f)
-                                                        enrollmentProgress = newProg
-                                                        currentInstruction = when {
-                                                            newProg < 0.25f -> "Silakan kedipkan mata..."
-                                                            newProg < 0.50f -> "Menoleh sedikit ke kiri..."
-                                                            newProg < 0.75f -> "Menoleh sedikit ke kanan..."
-                                                            newProg < 0.95f -> "Tatap lurus kembali..."
-                                                            else -> "Selesai! Memproses multi-sudut wajah..."
-                                                        }
-
-                                                        if (newProg >= 1.0f && !isComplete) {
-                                                            isComplete = true
-                                                            coroutineScope.launch {
-                                                                audioHelper.playSuccessBeep()
-                                                                val masterVector = FloatArray(128)
-                                                                for (v in collectedVectors) {
-                                                                    for (i in 0 until 128) masterVector[i] += v[i]
-                                                                }
-                                                                for (i in 0 until 128) masterVector[i] /= collectedVectors.size.toFloat()
-                                                                var sumSq = 0f
-                                                                for (valX in masterVector) sumSq += valX * valX
-                                                                val norm = kotlin.math.sqrt(maxOf(1e-8f, sumSq))
-                                                                for (i in 0 until 128) masterVector[i] /= norm
-                                                                val masterJson = FaceBiometricHelper.serializeEmbedding(masterVector)
-                                                                masterEmbeddingJson = masterJson
-
-                                                                val finalBitmap = bestSnapshotBitmap ?: Bitmap.createBitmap(400, 400, Bitmap.Config.ARGB_8888)
-                                                                val photosDir = File(context.filesDir, "employee_photos")
-                                                                if (!photosDir.exists()) photosDir.mkdirs()
-                                                                val photoFile = File(photosDir, "emp_${System.currentTimeMillis()}.jpg")
-                                                                FileOutputStream(photoFile).use { out ->
-                                                                    finalBitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
-                                                                }
-                                                                capturedPhotoPath = photoFile.absolutePath
-                                                                delay(800)
-                                                                onEnrollmentComplete(photoFile.absolutePath, masterJson)
-                                                            }
-                                                        }
-                                                    } else if (!isGoodSize) {
-                                                        currentInstruction = "Dekatkan wajah ke dalam lingkaran"
-                                                    }
-                                                } else {
-                                                    isFaceInsideCircle = false
-                                                    currentInstruction = "Posisikan wajah di dalam lingkaran"
-                                                }
-                                                frameBmp.recycle()
-                                            } catch (_: Exception) {
-                                                // ignore fallback frame exception
-                                            }
+                                            Log.w("FaceIdEnrollment", "Face detector notice: ${e.message}")
                                         }
                                         .addOnCompleteListener {
                                             imageProxy.close()

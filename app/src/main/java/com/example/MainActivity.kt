@@ -26,6 +26,7 @@ class MainActivity : ComponentActivity() {
 
         repository = AttendanceRepository(this)
         audioHelper = AudioFeedbackHelper(this)
+        FaceBiometricHelper.init(this)
 
         // Proactively ensure ML Kit Face Detection module is requested and downloaded via Google Play Services
         try {

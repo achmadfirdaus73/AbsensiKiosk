@@ -44,7 +44,7 @@ data class KioskSettings(
     val longitude: Double = 106.8456,
     val radiusMeters: Double = 150.0,
     val kioskPin: String = "8888",
-    val faceConfidenceThreshold: Float = 0.85f,
+    val faceConfidenceThreshold: Float = 0.70f,
     // Shift 1 (Pagi)
     val shift1Start: String = "08:00",
     val shift1End: String = "16:00",
