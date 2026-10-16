@@ -43,6 +43,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.util.AudioFeedbackHelper
 import com.example.util.FaceBiometricHelper
+import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
@@ -226,104 +227,98 @@ fun FaceIdEnrollmentDialog(
                                 .build()
 
                             imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy: ImageProxy ->
-                                val mediaImage = imageProxy.image
-                                if (mediaImage != null && !isComplete) {
-                                    val rotation = imageProxy.imageInfo.rotationDegrees
-                                    val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
+                                if (isComplete) {
+                                    imageProxy.close()
+                                    return@setAnalyzer
+                                }
 
-                                    faceDetector.process(inputImage)
-                                        .addOnSuccessListener { faces ->
-                                            if (faces.isNotEmpty()) {
-                                                val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() } ?: faces.first()
-                                                val box = face.boundingBox
-
-                                                // Forgiving, comfortable face geometry
-                                                val isGoodSize = box.width() >= 60 && box.height() >= 60
-                                                val yaw = Math.abs(face.headEulerAngleY)
-                                                val roll = Math.abs(face.headEulerAngleZ)
-                                                val isGoodPose = yaw <= 40f && roll <= 35f
-
-                                                if (!isGoodSize) {
-                                                    isFaceInsideCircle = false
-                                                    currentInstruction = "Dekatkan wajah sedikit ke kamera"
-                                                } else if (roll > 35f) {
-                                                    isFaceInsideCircle = false
-                                                    currentInstruction = "Posisikan kepala tegak (tidak miring)"
-                                                } else if (yaw > 40f) {
-                                                    isFaceInsideCircle = false
-                                                    currentInstruction = "Hadap lurus ke arah kamera"
-                                                } else {
-                                                    isFaceInsideCircle = true
-                                                    val frameIdx = (collectedVectors.size + 1).coerceAtMost(TARGET_ENROLLMENT_FRAMES)
-                                                    currentInstruction = "Wajah terdeteksi! Merekam ($frameIdx/$TARGET_ENROLLMENT_FRAMES)..."
-                                                }
-
-                                                val now = System.currentTimeMillis()
-                                                if (now - lastCollectionTime >= 90) {
-                                                    lastCollectionTime = now
-
-                                                    val frameBmp = try {
-                                                        val bmp = imageProxy.toBitmap()
-                                                        if (rotation != 0) {
-                                                            val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                                                            val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                                                            if (rotBmp != bmp) bmp.recycle()
-                                                            rotBmp
-                                                        } else bmp
-                                                    } catch (_: Exception) {
-                                                        null
-                                                    }
-
-                                                    if (frameBmp != null) {
-                                                        latestDetectedFace = face
-                                                        latestFrameBitmap?.recycle()
-                                                        latestFrameBitmap = Bitmap.createBitmap(frameBmp)
-
-                                                        if (isGoodSize && isGoodPose && enrollmentProgress < 1.0f && !isComplete) {
-                                                            val alignedCrop = FaceBiometricHelper.alignAndCropFace(frameBmp, face)
-                                                            val vector = if (alignedCrop != null) {
-                                                                FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
-                                                            } else FloatArray(0)
-
-                                                            if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
-                                                                collectedVectors.add(vector)
-
-                                                                if (bestSnapshotBitmap == null && yaw <= 18f && roll <= 15f) {
-                                                                    bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
-                                                                }
-
-                                                                val newProg = (collectedVectors.size.toFloat() / TARGET_ENROLLMENT_FRAMES).coerceIn(0f, 1f)
-                                                                enrollmentProgress = newProg
-                                                                currentInstruction = "Merekam wajah: ${collectedVectors.size}/$TARGET_ENROLLMENT_FRAMES frame"
-
-                                                                if (newProg >= 1.0f && !isComplete) {
-                                                                    currentInstruction = "Selesai! 10 frame biometrik tersimpan..."
-                                                                    finishEnrollment(collectedVectors, bestSnapshotBitmap ?: latestFrameBitmap)
-                                                                }
-                                                            } else {
-                                                                Log.w("FaceIdEnrollment", "Feature vector extraction returned size: ${vector.size}")
-                                                            }
-
-                                                            alignedCrop?.recycle()
-                                                        }
-
-                                                        frameBmp.recycle()
-                                                    }
-                                                }
-                                            } else {
-                                                isFaceInsideCircle = false
-                                                currentInstruction = "Posisikan wajah di dalam lingkaran"
-                                            }
-                                        }
-                                        .addOnFailureListener { e ->
-                                            Log.w("FaceIdEnrollment", "Face detector notice: ${e.message}")
-                                        }
-                                        .addOnCompleteListener {
-                                            imageProxy.close()
-                                        }
-                                } else {
+                                val rotation = imageProxy.imageInfo.rotationDegrees
+                                val frameBmp = try {
+                                    val bmp = imageProxy.toBitmap()
+                                    if (rotation != 0) {
+                                        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                                        val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                                        if (rotBmp != bmp) bmp.recycle()
+                                        rotBmp
+                                    } else bmp
+                                } catch (e: Exception) {
+                                    Log.w("FaceIdEnrollment", "toBitmap error: ${e.message}")
+                                    null
+                                } finally {
                                     imageProxy.close()
                                 }
+
+                                if (frameBmp == null) return@setAnalyzer
+
+                                val inputImage = InputImage.fromBitmap(frameBmp, 0)
+                                val faces: List<Face> = try {
+                                    Tasks.await(faceDetector.process(inputImage))
+                                } catch (e: Exception) {
+                                    emptyList()
+                                }
+
+                                if (faces.isNotEmpty()) {
+                                    val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() } ?: faces.first()
+                                    val box = face.boundingBox
+
+                                    val isGoodSize = box.width() >= 60 && box.height() >= 60
+                                    val yaw = Math.abs(face.headEulerAngleY)
+                                    val roll = Math.abs(face.headEulerAngleZ)
+                                    val isGoodPose = yaw <= 40f && roll <= 35f
+
+                                    latestDetectedFace = face
+                                    latestFrameBitmap?.recycle()
+                                    latestFrameBitmap = Bitmap.createBitmap(frameBmp)
+
+                                    if (!isGoodSize) {
+                                        isFaceInsideCircle = false
+                                        currentInstruction = "Dekatkan wajah sedikit ke kamera"
+                                    } else if (roll > 35f) {
+                                        isFaceInsideCircle = false
+                                        currentInstruction = "Posisikan kepala tegak (tidak miring)"
+                                    } else if (yaw > 40f) {
+                                        isFaceInsideCircle = false
+                                        currentInstruction = "Hadap lurus ke arah kamera"
+                                    } else {
+                                        isFaceInsideCircle = true
+
+                                        val now = System.currentTimeMillis()
+                                        if (now - lastCollectionTime >= 80L && enrollmentProgress < 1.0f && !isComplete) {
+                                            lastCollectionTime = now
+
+                                            val alignedCrop = FaceBiometricHelper.alignAndCropFace(frameBmp, face)
+                                            val vector = if (alignedCrop != null) {
+                                                FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
+                                            } else FloatArray(0)
+                                            alignedCrop?.recycle()
+
+                                            if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
+                                                collectedVectors.add(vector)
+
+                                                if (bestSnapshotBitmap == null && yaw <= 18f && roll <= 15f) {
+                                                    bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
+                                                }
+
+                                                val count = collectedVectors.size
+                                                val newProg = (count.toFloat() / TARGET_ENROLLMENT_FRAMES).coerceIn(0f, 1f)
+                                                enrollmentProgress = newProg
+                                                currentInstruction = "Merekam wajah: $count/$TARGET_ENROLLMENT_FRAMES frame..."
+
+                                                if (count >= TARGET_ENROLLMENT_FRAMES && !isComplete) {
+                                                    currentInstruction = "Selesai! 10 frame biometrik tersimpan..."
+                                                    finishEnrollment(collectedVectors, bestSnapshotBitmap ?: latestFrameBitmap)
+                                                }
+                                            } else {
+                                                Log.w("FaceIdEnrollment", "MobileFaceNet vector size: ${vector.size}")
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    isFaceInsideCircle = false
+                                    currentInstruction = "Posisikan wajah di dalam lingkaran"
+                                }
+
+                                frameBmp.recycle()
                             }
 
                             val cameraSelector = if (useFrontCamera && cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
