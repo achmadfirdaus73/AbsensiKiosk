@@ -345,15 +345,17 @@ object FaceBiometricHelper {
             } else {
                 // Bounding Box Crop with proportional margin
                 val box = faceInfo.boundingBox
-                val marginX = (box.width() * 0.15f).toInt()
-                val marginY = (box.height() * 0.15f).toInt()
-                val left = max(0, box.left - marginX)
-                val top = max(0, box.top - marginY)
-                val width = min(sourceBitmap.width - left, box.width() + marginX * 2)
-                val height = min(sourceBitmap.height - top, box.height() + marginY * 2)
+                val marginX = (max(1, box.width()) * 0.15f).toInt()
+                val marginY = (max(1, box.height()) * 0.15f).toInt()
+                val left = max(0, min(sourceBitmap.width - 1, box.left - marginX))
+                val top = max(0, min(sourceBitmap.height - 1, box.top - marginY))
+                val rawW = max(1, box.width() + marginX * 2)
+                val rawH = max(1, box.height() + marginY * 2)
+                val safeW = min(rawW, sourceBitmap.width - left)
+                val safeH = min(rawH, sourceBitmap.height - top)
 
-                if (width > 0 && height > 0) {
-                    val rawBoxCrop = Bitmap.createBitmap(sourceBitmap, left, top, width, height)
+                if (safeW > 10 && safeH > 10) {
+                    val rawBoxCrop = Bitmap.createBitmap(sourceBitmap, left, top, safeW, safeH)
                     val scaled = Bitmap.createScaledBitmap(rawBoxCrop, CANONICAL_IMAGE_SIZE, CANONICAL_IMAGE_SIZE, true)
                     if (scaled != rawBoxCrop) rawBoxCrop.recycle()
                     scaled
@@ -366,8 +368,8 @@ object FaceBiometricHelper {
             val balancedBitmap = equalizeIllumination(rawCrop)
             if (balancedBitmap != rawCrop) rawCrop.recycle()
             balancedBitmap
-        } catch (e: Exception) {
-            Log.w(TAG, "Error aligning and cropping face: ${e.message}")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Error aligning and cropping face: ${t.message}")
             null
         }
     }
