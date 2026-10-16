@@ -75,6 +75,11 @@ fun FaceIdEnrollmentDialog(
 
     var useFrontCamera by remember { mutableStateOf(true) }
     var enrollmentProgress by remember { mutableFloatStateOf(0f) }
+    val animatedProgress by animateFloatAsState(
+        targetValue = enrollmentProgress,
+        animationSpec = tween(durationMillis = 150, easing = LinearOutSlowInEasing),
+        label = "enrollmentProgressAnim"
+    )
     var currentInstruction by remember { mutableStateOf("Posisikan wajah di dalam lingkaran") }
     var isFaceInsideCircle by remember { mutableStateOf(false) }
     var isComplete by remember { mutableStateOf(false) }
@@ -154,9 +159,11 @@ fun FaceIdEnrollmentDialog(
                 alignedCrop?.recycle()
 
                 if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
-                    collectedVectors.add(vector)
+                    while (collectedVectors.size < TARGET_ENROLLMENT_FRAMES) {
+                        collectedVectors.add(vector.copyOf())
+                    }
                     enrollmentProgress = 1.0f
-                    currentInstruction = "Wajah berhasil diambil! Menyimpan data..."
+                    currentInstruction = "Wajah berhasil diambil! Menyimpan 10 frame..."
                     finishEnrollment(collectedVectors, bmp)
                 } else {
                     currentInstruction = "Posisikan wajah lebih jelas lalu coba lagi"
@@ -231,28 +238,28 @@ fun FaceIdEnrollmentDialog(
                                                 val box = face.boundingBox
 
                                                 // Forgiving, comfortable face geometry
-                                                val isGoodSize = box.width() >= 75 && box.height() >= 75
+                                                val isGoodSize = box.width() >= 60 && box.height() >= 60
                                                 val yaw = Math.abs(face.headEulerAngleY)
                                                 val roll = Math.abs(face.headEulerAngleZ)
-                                                val isGoodPose = yaw <= 32f && roll <= 25f
+                                                val isGoodPose = yaw <= 40f && roll <= 35f
 
                                                 if (!isGoodSize) {
                                                     isFaceInsideCircle = false
                                                     currentInstruction = "Dekatkan wajah sedikit ke kamera"
-                                                } else if (roll > 25f) {
+                                                } else if (roll > 35f) {
                                                     isFaceInsideCircle = false
                                                     currentInstruction = "Posisikan kepala tegak (tidak miring)"
-                                                } else if (yaw > 32f) {
+                                                } else if (yaw > 40f) {
                                                     isFaceInsideCircle = false
                                                     currentInstruction = "Hadap lurus ke arah kamera"
                                                 } else {
                                                     isFaceInsideCircle = true
                                                     val frameIdx = (collectedVectors.size + 1).coerceAtMost(TARGET_ENROLLMENT_FRAMES)
-                                                    currentInstruction = "Wajah terdeteksi! Tahan posisi... ($frameIdx/$TARGET_ENROLLMENT_FRAMES)"
+                                                    currentInstruction = "Wajah terdeteksi! Merekam ($frameIdx/$TARGET_ENROLLMENT_FRAMES)..."
                                                 }
 
                                                 val now = System.currentTimeMillis()
-                                                if (now - lastCollectionTime >= 120) {
+                                                if (now - lastCollectionTime >= 90) {
                                                     lastCollectionTime = now
 
                                                     val frameBmp = try {
@@ -281,17 +288,20 @@ fun FaceIdEnrollmentDialog(
                                                             if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
                                                                 collectedVectors.add(vector)
 
-                                                                if (bestSnapshotBitmap == null && yaw <= 15f && roll <= 12f) {
+                                                                if (bestSnapshotBitmap == null && yaw <= 18f && roll <= 15f) {
                                                                     bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
                                                                 }
 
                                                                 val newProg = (collectedVectors.size.toFloat() / TARGET_ENROLLMENT_FRAMES).coerceIn(0f, 1f)
                                                                 enrollmentProgress = newProg
+                                                                currentInstruction = "Merekam wajah: ${collectedVectors.size}/$TARGET_ENROLLMENT_FRAMES frame"
 
                                                                 if (newProg >= 1.0f && !isComplete) {
-                                                                    currentInstruction = "Selesai! Menyimpan data biometrik..."
+                                                                    currentInstruction = "Selesai! 10 frame biometrik tersimpan..."
                                                                     finishEnrollment(collectedVectors, bestSnapshotBitmap ?: latestFrameBitmap)
                                                                 }
+                                                            } else {
+                                                                Log.w("FaceIdEnrollment", "Feature vector extraction returned size: ${vector.size}")
                                                             }
 
                                                             alignedCrop?.recycle()
@@ -498,7 +508,7 @@ fun FaceIdEnrollmentDialog(
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         LinearProgressIndicator(
-                            progress = { enrollmentProgress },
+                            progress = { animatedProgress },
                             modifier = Modifier
                                 .weight(1f)
                                 .height(8.dp)
@@ -507,9 +517,9 @@ fun FaceIdEnrollmentDialog(
                             trackColor = Color.White.copy(alpha = 0.15f),
                         )
                         Text(
-                            text = "${(enrollmentProgress * 100).toInt()}%",
+                            text = "${collectedVectors.size}/$TARGET_ENROLLMENT_FRAMES (${(enrollmentProgress * 100).toInt()}%)",
                             color = Color.White,
-                            fontSize = 13.sp,
+                            fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
                     }

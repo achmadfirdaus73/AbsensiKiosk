@@ -227,21 +227,26 @@ object FaceBiometricHelper {
             if (isModelLoaded && tfliteInterpreter != null) return true
             return try {
                 val candidates = listOf("mobile_face_net.tflite", "mobilefacenet.tflite")
-                var mappedBuffer: MappedByteBuffer? = null
+                var modelBuffer: ByteBuffer? = null
                 for (name in candidates) {
                     try {
-                        mappedBuffer = loadModelFile(context.assets, name)
-                        break
-                    } catch (_: Exception) {}
+                        modelBuffer = loadModelByteBuffer(context.assets, name)
+                        if (modelBuffer != null) {
+                            Log.i(TAG, "Loaded model candidate: $name (${modelBuffer.capacity()} bytes)")
+                            break
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed loading candidate $name: ${e.message}")
+                    }
                 }
 
-                if (mappedBuffer != null) {
+                if (modelBuffer != null) {
                     val options = Interpreter.Options().apply {
                         setNumThreads(4)
                     }
-                    tfliteInterpreter = Interpreter(mappedBuffer, options)
+                    tfliteInterpreter = Interpreter(modelBuffer, options)
                     isModelLoaded = true
-                    Log.i(TAG, "MobileFaceNet TFLite successfully loaded ($EMBEDDING_DIM-D).")
+                    Log.i(TAG, "MobileFaceNet TFLite successfully initialized ($EMBEDDING_DIM-D).")
                     true
                 } else {
                     Log.e(TAG, "MobileFaceNet model file not found in assets. Recognition disabled for security.")
@@ -249,7 +254,7 @@ object FaceBiometricHelper {
                     false
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error initializing MobileFaceNet: ${e.message}")
+                Log.e(TAG, "Error initializing MobileFaceNet: ${e.message}", e)
                 isModelLoaded = false
                 false
             }
@@ -264,14 +269,31 @@ object FaceBiometricHelper {
         }
     }
 
-    @Throws(IOException::class)
-    private fun loadModelFile(assetManager: AssetManager, filePath: String): MappedByteBuffer {
-        val fileDescriptor = assetManager.openFd(filePath)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+    private fun loadModelByteBuffer(assetManager: AssetManager, filePath: String): ByteBuffer? {
+        return try {
+            val fileDescriptor = assetManager.openFd(filePath)
+            val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
+            val fileChannel = inputStream.channel
+            val startOffset = fileDescriptor.startOffset
+            val declaredLength = fileDescriptor.declaredLength
+            fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        } catch (e: Exception) {
+            Log.i(TAG, "openFd for $filePath unmapped (${e.message}), loading via asset stream into direct buffer")
+            try {
+                assetManager.open(filePath).use { stream ->
+                    val bytes = stream.readBytes()
+                    val direct = ByteBuffer.allocateDirect(bytes.size).apply {
+                        order(ByteOrder.nativeOrder())
+                        put(bytes)
+                        rewind()
+                    }
+                    direct
+                }
+            } catch (streamEx: Exception) {
+                Log.e(TAG, "Failed reading $filePath from stream: ${streamEx.message}")
+                null
+            }
+        }
     }
 
     /**
