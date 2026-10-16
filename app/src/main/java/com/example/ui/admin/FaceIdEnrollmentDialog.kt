@@ -77,7 +77,7 @@ fun FaceIdEnrollmentDialog(
     var enrollmentProgress by remember { mutableFloatStateOf(0f) }
     val animatedProgress by animateFloatAsState(
         targetValue = enrollmentProgress,
-        animationSpec = tween(durationMillis = 120, easing = LinearOutSlowInEasing),
+        animationSpec = tween(durationMillis = 100, easing = LinearOutSlowInEasing),
         label = "enrollmentProgressAnim"
     )
     var currentInstruction by remember { mutableStateOf("Posisikan wajah di dalam lingkaran") }
@@ -88,7 +88,7 @@ fun FaceIdEnrollmentDialog(
     var masterEmbeddingJson by remember { mutableStateOf<String?>(null) }
 
     val collectedVectors = remember { mutableListOf<FloatArray>() }
-    var lastCollectionTime = remember { 0L }
+    var lastCollectionTimestamp = remember { 0L }
     var bestSnapshotBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var latestDetectedFace by remember { mutableStateOf<Face?>(null) }
     var latestFrameBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -114,7 +114,7 @@ fun FaceIdEnrollmentDialog(
                 FaceBiometricHelper.l2Normalize(preliminaryMean)
 
                 val validVectors = vectors.filter { v ->
-                    FaceBiometricHelper.calculateSimilarity(v, preliminaryMean) >= 0.45f
+                    FaceBiometricHelper.calculateSimilarity(v, preliminaryMean) >= 0.40f
                 }
                 val finalPool = if (validVectors.isNotEmpty()) validVectors else vectors
 
@@ -234,6 +234,7 @@ fun FaceIdEnrollmentDialog(
                             }
 
                             val imageAnalysis = ImageAnalysis.Builder()
+                                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                                 .setTargetResolution(Size(480, 640))
                                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                                 .build()
@@ -244,15 +245,25 @@ fun FaceIdEnrollmentDialog(
                                     return@setAnalyzer
                                 }
 
-                                val mediaImage = imageProxy.image
-                                if (mediaImage == null) {
+                                val rotation = imageProxy.imageInfo.rotationDegrees
+                                val uprightBmp = try {
+                                    val rawBmp = imageProxy.toBitmap()
+                                    if (rotation != 0) {
+                                        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+                                        val rotBmp = Bitmap.createBitmap(rawBmp, 0, 0, rawBmp.width, rawBmp.height, matrix, true)
+                                        if (rotBmp != rawBmp) rawBmp.recycle()
+                                        rotBmp
+                                    } else rawBmp
+                                } catch (t: Throwable) {
+                                    Log.e("FaceIdEnrollment", "toBitmap error: ${t.message}")
+                                    null
+                                } finally {
                                     imageProxy.close()
-                                    return@setAnalyzer
                                 }
 
-                                val rotation = imageProxy.imageInfo.rotationDegrees
-                                val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
+                                if (uprightBmp == null) return@setAnalyzer
 
+                                val inputImage = InputImage.fromBitmap(uprightBmp, 0)
                                 faceDetector.process(inputImage)
                                     .addOnSuccessListener(cameraExecutor) { faces ->
                                         try {
@@ -262,11 +273,13 @@ fun FaceIdEnrollmentDialog(
                                                 val face = faces.maxByOrNull { it.boundingBox.width() * it.boundingBox.height() } ?: faces.first()
                                                 val box = face.boundingBox
 
-                                                val isGoodSize = box.width() >= 50 && box.height() >= 50
+                                                val isGoodSize = box.width() >= 45 && box.height() >= 45
                                                 val yaw = Math.abs(face.headEulerAngleY)
                                                 val roll = Math.abs(face.headEulerAngleZ)
 
                                                 latestDetectedFace = face
+                                                latestFrameBitmap?.recycle()
+                                                latestFrameBitmap = Bitmap.createBitmap(uprightBmp)
 
                                                 if (!isGoodSize) {
                                                     mainExecutor.execute {
@@ -275,14 +288,14 @@ fun FaceIdEnrollmentDialog(
                                                             currentInstruction = "Dekatkan wajah sedikit ke kamera"
                                                         }
                                                     }
-                                                } else if (roll > 40f) {
+                                                } else if (roll > 50f) {
                                                     mainExecutor.execute {
                                                         if (!isComplete) {
                                                             isFaceInsideCircle = false
-                                                            currentInstruction = "Posisikan kepala tegak (tidak miring)"
+                                                            currentInstruction = "Tegakkan posisi kepala"
                                                         }
                                                     }
-                                                } else if (yaw > 40f) {
+                                                } else if (yaw > 50f) {
                                                     mainExecutor.execute {
                                                         if (!isComplete) {
                                                             isFaceInsideCircle = false
@@ -291,68 +304,46 @@ fun FaceIdEnrollmentDialog(
                                                     }
                                                 } else {
                                                     val now = System.currentTimeMillis()
-                                                    val shouldCollect = (now - lastCollectionTime >= 100L) &&
+                                                    val shouldCollect = (now - lastCollectionTimestamp >= 70L) &&
                                                             (collectedVectors.size < TARGET_ENROLLMENT_FRAMES) &&
                                                             !isComplete
 
                                                     if (shouldCollect) {
-                                                        lastCollectionTime = now
+                                                        lastCollectionTimestamp = now
 
-                                                        val frameBmp = try {
-                                                            val bmp = imageProxy.toBitmap()
-                                                            if (rotation != 0) {
-                                                                val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
-                                                                val rotBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                                                                if (rotBmp != bmp) bmp.recycle()
-                                                                rotBmp
-                                                            } else bmp
-                                                        } catch (t: Throwable) {
-                                                            Log.w("FaceIdEnrollment", "toBitmap error: ${t.message}")
-                                                            null
-                                                        }
+                                                        val alignedCrop = FaceBiometricHelper.alignAndCropFace(uprightBmp, face)
+                                                        val vector = if (alignedCrop != null) {
+                                                            FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
+                                                        } else FloatArray(0)
+                                                        alignedCrop?.recycle()
 
-                                                        if (frameBmp != null) {
-                                                            try {
-                                                                latestFrameBitmap?.recycle()
-                                                                latestFrameBitmap = Bitmap.createBitmap(frameBmp)
+                                                        if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
+                                                            synchronized(collectedVectors) {
+                                                                collectedVectors.add(vector)
 
-                                                                val alignedCrop = FaceBiometricHelper.alignAndCropFace(frameBmp, face)
-                                                                val vector = if (alignedCrop != null) {
-                                                                    FaceBiometricHelper.extractFeatureVector(face, alignedCrop, ctx)
-                                                                } else FloatArray(0)
-                                                                alignedCrop?.recycle()
-
-                                                                if (vector.size == FaceBiometricHelper.EMBEDDING_DIM) {
-                                                                    synchronized(collectedVectors) {
-                                                                        collectedVectors.add(vector)
-
-                                                                        if (bestSnapshotBitmap == null || (yaw <= 15f && roll <= 15f)) {
-                                                                            bestSnapshotBitmap?.recycle()
-                                                                            bestSnapshotBitmap = Bitmap.createBitmap(frameBmp)
-                                                                        }
-
-                                                                        val count = collectedVectors.size
-                                                                        val newProg = (count.toFloat() / TARGET_ENROLLMENT_FRAMES).coerceIn(0f, 1f)
-
-                                                                        mainExecutor.execute {
-                                                                            if (!isComplete) {
-                                                                                enrollmentProgress = newProg
-                                                                                isFaceInsideCircle = true
-                                                                                currentInstruction = "Merekam wajah: $count/$TARGET_ENROLLMENT_FRAMES frame..."
-                                                                            }
-                                                                        }
-
-                                                                        if (count >= TARGET_ENROLLMENT_FRAMES && !isComplete) {
-                                                                            val safePhoto = bestSnapshotBitmap ?: Bitmap.createBitmap(frameBmp)
-                                                                            finishEnrollment(ArrayList(collectedVectors), safePhoto)
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    Log.w("FaceIdEnrollment", "Vector extraction returned size ${vector.size}")
+                                                                if (bestSnapshotBitmap == null || (yaw <= 18f && roll <= 18f)) {
+                                                                    bestSnapshotBitmap?.recycle()
+                                                                    bestSnapshotBitmap = Bitmap.createBitmap(uprightBmp)
                                                                 }
-                                                            } finally {
-                                                                frameBmp.recycle()
+
+                                                                val count = collectedVectors.size
+                                                                val newProg = (count.toFloat() / TARGET_ENROLLMENT_FRAMES).coerceIn(0f, 1f)
+
+                                                                mainExecutor.execute {
+                                                                    if (!isComplete) {
+                                                                        enrollmentProgress = newProg
+                                                                        isFaceInsideCircle = true
+                                                                        currentInstruction = "Merekam wajah: $count/$TARGET_ENROLLMENT_FRAMES frame..."
+                                                                    }
+                                                                }
+
+                                                                if (count >= TARGET_ENROLLMENT_FRAMES && !isComplete) {
+                                                                    val safePhoto = bestSnapshotBitmap ?: Bitmap.createBitmap(uprightBmp)
+                                                                    finishEnrollment(ArrayList(collectedVectors), safePhoto)
+                                                                }
                                                             }
+                                                        } else {
+                                                            Log.w("FaceIdEnrollment", "MobileFaceNet vector size: ${vector.size}")
                                                         }
                                                     } else {
                                                         val count = collectedVectors.size
@@ -361,10 +352,10 @@ fun FaceIdEnrollmentDialog(
                                                             if (!isComplete) {
                                                                 enrollmentProgress = newProg
                                                                 isFaceInsideCircle = true
-                                                                if (count == 0) {
-                                                                    currentInstruction = "Wajah terdeteksi, bersiap merekam..."
-                                                                } else {
+                                                                if (count > 0) {
                                                                     currentInstruction = "Merekam wajah: $count/$TARGET_ENROLLMENT_FRAMES frame..."
+                                                                } else {
+                                                                    currentInstruction = "Wajah terdeteksi, merekam..."
                                                                 }
                                                             }
                                                         }
@@ -378,15 +369,13 @@ fun FaceIdEnrollmentDialog(
                                                     }
                                                 }
                                             }
-                                        } catch (t: Throwable) {
-                                            Log.e("FaceIdEnrollment", "Analyzer handling error: ${t.message}", t)
+                                        } finally {
+                                            uprightBmp.recycle()
                                         }
                                     }
                                     .addOnFailureListener(cameraExecutor) { e ->
-                                        Log.w("FaceIdEnrollment", "ML Kit processing failure: ${e.message}")
-                                    }
-                                    .addOnCompleteListener(cameraExecutor) {
-                                        imageProxy.close()
+                                        Log.w("FaceIdEnrollment", "Face detection failure: ${e.message}")
+                                        uprightBmp.recycle()
                                     }
                             }
 

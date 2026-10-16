@@ -313,9 +313,9 @@ object FaceBiometricHelper {
 
         return try {
             val rawCrop = if (leftEye != null && rightEye != null) {
-                // 1. Calculate eye angle and midpoint
-                val deltaX = rightEye.x - leftEye.x
-                val deltaY = rightEye.y - leftEye.y
+                // 1. Calculate eye angle and midpoint (vector from screen-left eye to screen-right eye)
+                val deltaX = leftEye.x - rightEye.x
+                val deltaY = leftEye.y - rightEye.y
                 val currentEyeDist = hypot(deltaX, deltaY)
                 val eyeAngleDegrees = Math.toDegrees(atan2(deltaY.toDouble(), deltaX.toDouble())).toFloat()
                 val eyeMidX = (leftEye.x + rightEye.x) / 2f
